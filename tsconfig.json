@@ -1,0 +1,38 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "jsx": "preserve",
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "noEmit": true,
+    "types": ["vite/client", "node"],
+    "baseUrl": ".",
+    "paths": {
+      "@zvm/web": ["./zvm-core/web/src/index.ts"],
+      "@zvm/web/*": ["./zvm-core/web/src/*"],
+      // The zvm-core submodule has no node_modules of its own; its peer
+      // dependencies are this app's copies.
+      "vue": ["./node_modules/vue"],
+      "viem": ["./node_modules/viem"],
+      "viem/*": ["./node_modules/viem/*"]
+    }
+  },
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.vue",
+    "env.d.ts",
+    "vite.config.ts",
+    "./zvm-core/web/src/**/*.ts",
+    "./zvm-core/web/src/**/*.vue"
+  ]
+}
