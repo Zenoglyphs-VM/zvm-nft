@@ -22,7 +22,21 @@ jobs:
           cache: npm
 
       - run: npm ci
+      - run: npm run test:orders
       # The build refuses to run without its endpoints; the example has them.
       - run: cp .env.example .env
       - run: npm run typecheck
       - run: npm run build
+
+  go-vectors:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.0'
+          cache-dependency-path: zvm-core/go.sum
+      - run: go test -count=1 -v ./vectors
+        working-directory: zvm-core

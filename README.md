@@ -12,6 +12,7 @@ cp .env.example .env
 npm run dev        # http://localhost:47300/zvm-nft/
 npm run build      # dist/
 npm run typecheck
+npm run test:orders # exact wire values and pinned Go order vectors
 ```
 
 No node is built in. `VITE_ZVM_NODE` is a node's API base, the URL its `/api`
@@ -24,3 +25,6 @@ devnet's. The server side is in
 
 MIT licence. The full guide, with how it works and why:
 [docs/GUIDE.md](docs/GUIDE.md).
+
+Order protocol, frontend responsibilities and remaining integration gates:
+[docs/ORDER_COMPATIBILITY.md](docs/ORDER_COMPATIBILITY.md).
