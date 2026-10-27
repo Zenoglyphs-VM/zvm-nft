@@ -15,12 +15,13 @@ function deferred() {
   const promise = new Promise(done => {resolve = done})
   return {promise, resolve}
 }
-async function fixture() {
+async function fixture(status = 'success', receiptError = null) {
   const started = deferred(), release = deferred()
   const counts = {estimate: 0, fees: 0, send: 0, receipt: 0}
+  const receipt = {status, transactionHash: hash, from: owner, to: operator, logs: []}
   const client = {
     estimateGas: async () => {counts.estimate++; started.resolve(); await release.promise; return 21000n},
-    waitForTransactionReceipt: async () => {counts.receipt++; return {status: 'success'}},
+    waitForTransactionReceipt: async () => {counts.receipt++; if (receiptError) throw receiptError; return receipt},
   }
   const evm = {publicClient: () => client,
     estimateFees: async () => {counts.fees++; return {maxFeePerGas: 200n, maxPriorityFeePerGas: 100n}},
@@ -40,7 +41,7 @@ async function fixture() {
     }, {context})
   })
   await program.evaluate({timeout: 5000})
-  return {run: program.namespace.runCalls, started, release, counts}
+  return {run: program.namespace.runCalls, started, release, counts, receipt}
 }
 const call = guard => ({to: operator, value: 0n, data: '0x', gas: 70000n, label: 'Remove fixture permission', guard})
 
@@ -74,8 +75,25 @@ test('existing calls without a context guard still wait for their receipt', asyn
   f.release.resolve()
   const steps = await result
   assert.equal(steps[0].state, 'done')
+  assert.strictEqual(steps[0].receipt, f.receipt)
+  assert.equal(steps[0].receipt.transactionHash, hash)
   assert.equal(f.counts.send, 1)
   assert.equal(f.counts.receipt, 1)
   assert.ok(states.includes('published'))
   assert.equal(states.at(-1), 'done')
 })
+
+for (const [name, status, error] of [
+  ['a reverted transaction', 'reverted', null],
+  ['an unavailable receipt', 'success', new Error('Receipt unavailable')],
+]) {
+  test(name + ' cannot supply a successful checkout receipt', async () => {
+    const f = await fixture(status, error)
+    f.release.resolve()
+    const steps = await f.run([call(undefined)], () => {})
+    assert.equal(steps[0].state, 'failed')
+    assert.equal(steps[0].receipt, undefined)
+    assert.equal(f.counts.send, 1)
+    assert.equal(f.counts.receipt, 1)
+  })
+}

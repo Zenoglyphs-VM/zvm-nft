@@ -7,11 +7,13 @@ import {useRoute} from 'vue-router'
 import {parseUnits, type Address} from 'viem'
 import {api} from '../core/api'
 import {wallet} from '../core/wallet'
+import {endpoint} from '../core/endpoint'
+import {batchMessage, batchResult, type BatchResult} from '../core/batch-result'
 import {publicClient} from '../core/evm'
 import {ago, number, orderExpiry, units} from '../core/format'
 import {collectionAbi, currencyOf, isZero, parseMeta} from '../core/nft'
 import {exchangeAddress, sameAddress, useMarket} from '../core/market'
-import {bidFunding, BUY, buyManyCall, exchange, fetchFillable, newOrder, signOrder, submitOrders} from '../core/orders'
+import {bidFunding, BUY, buyManyCall, exchange, fetchFillable, newOrder, signOrder, submitOrders, type Input} from '../core/orders'
 import Panel from '../components/Panel.vue'
 import Badge from '@zvm/web/components/Badge.vue'
 import StateBlock from '../components/StateBlock.vue'
@@ -39,6 +41,7 @@ const offering = ref(false)
 const offerPrice = ref('')
 const offerCount = ref(1)
 const sweepCount = ref(3)
+const sweepResult = ref<BatchResult | null>(null)
 
 const market = useMarket()
 const meta = computed(() => parseMeta(collection.value?.meta))
@@ -129,15 +132,31 @@ async function sweep() {
   const ex = exchangeAddress()
   const buyer = market.account()
   if (!ex || !buyer) return
+  sweepResult.value = null
+  const chainId = wallet.info?.l2.chainId, node = endpoint.url, selectedCollection = address.value
+  const current = () => sameAddress(market.account(), buyer) && wallet.info?.l2.chainId === chainId &&
+    wallet.evm.chainId === chainId && endpoint.url === node && sameAddress(exchangeAddress(), ex) &&
+    sameAddress(address.value, selectedCollection)
+  const guard = () => {if (!current()) throw new Error('The account or node changed. Review the sweep again.')}
+  let submitted: Input[] = []
+  let nativeSent = 0n
   await market.run(async () => {
-    const listings = await api.nftListings({collection: address.value, sort: 'price', limit: 50})
+    const listings = await api.nftListings({collection: selectedCollection, sort: 'price', limit: 50})
     const picked = listings.filter((l) => isZero(l.currency) && !sameAddress(l.seller, buyer)).slice(0, sweepCount.value)
     if (!picked.length) throw new Error('nothing here is for sale in ZNN by someone else')
     const inputs = await fetchFillable(picked.map((l) => l.hash))
     if (!inputs.length) throw new Error('every listing here was bought a moment ago — try again')
-    const total = inputs.reduce((sum, i) => sum + i.order.price, 0n)
-    return [buyManyCall(ex, inputs, total)]
-  }, load)
+    submitted = inputs
+    nativeSent = inputs.reduce((sum, i) => sum + i.order.price, 0n)
+    guard()
+    return [{...buyManyCall(ex, inputs, nativeSent), guard}]
+  }, async () => {
+    const step = [...market.steps.value].reverse().find(step => step.receipt)
+    if (!step?.receipt || step.txHash !== step.receipt.transactionHash) throw new Error('The executed sweep receipt is unavailable.')
+    sweepResult.value = batchResult(step.receipt, ex, buyer as Address, submitted, nativeSent)
+    guard()
+    await load()
+  })
 }
 </script>
 
@@ -198,6 +217,7 @@ async function sweep() {
         <div v-if="market.error.value || market.steps.value.length" class="px-4 pb-4 grid gap-3 max-w-[520px]">
           <p v-if="market.error.value" data-market-error class="text-[13px] text-[var(--color-danger)]">{{ market.error.value }}</p>
           <StepList :steps="market.steps.value" />
+          <p v-if="sweepResult" data-batch-outcome role="status" class="text-[13px]">{{ batchMessage(sweepResult) }}</p>
         </div>
       </Panel>
 

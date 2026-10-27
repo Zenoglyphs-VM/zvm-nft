@@ -3,7 +3,7 @@
 // the relayer, which posts it to NoM, and it is a ZVM transaction once the
 // momentum carrying it is derived.
 
-import type {Address, Hex} from 'viem'
+import type {Address, Hex, TransactionReceipt} from 'viem'
 import {estimateFees, publicClient, walletClient} from './evm'
 import {wallet} from './wallet'
 /** One contract call a wallet is asked to sign. */
@@ -23,6 +23,8 @@ export interface Step {
   state: 'pending' | 'signing' | 'published' | 'done' | 'failed'
   txHash?: string
   detail?: string
+  /** The executed receipt, kept in memory for flow-specific reconciliation. */
+  receipt?: TransactionReceipt
 }
 
 /** The account calls are sent from, or null when no wallet is connected. */
@@ -68,6 +70,7 @@ export async function runCalls(calls: Call[], update: (steps: Step[]) => void): 
       emit()
       const r = await client.waitForTransactionReceipt({hash, ...RECEIPT})
       if (r.status !== 'success') throw new Error('reverted on the ZVM')
+      step.receipt = r
       step.state = 'done'
       emit()
     } catch (err) {
