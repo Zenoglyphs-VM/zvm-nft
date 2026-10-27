@@ -8,6 +8,7 @@ import {computed, onMounted, ref, watch} from 'vue'
 import {useRoute} from 'vue-router'
 import {parseUnits, type Address} from 'viem'
 import {api} from '../core/api'
+import {base} from '../core/endpoint'
 import {ago, number, units} from '../core/format'
 import {currencyOf, parseMeta} from '../core/nft'
 import {exchangeAddress, sameAddress, useMarket} from '../core/market'
@@ -137,7 +138,7 @@ const tabs = [
           >
             Cancel all {{ profile.openOrders.length }} orders
           </button>
-          <router-link class="btn" :to="`/address/${profile.address}`">Explorer view</router-link>
+          <a class="btn" :href="`${base()}/address/${profile.address}`" target="_blank" rel="noreferrer">Explorer view</a>
         </div>
       </Panel>
 
