@@ -22,6 +22,7 @@ import HashLink from '../components/HashLink.vue'
 import NftCard from '../components/NftCard.vue'
 import NftImage from '../components/NftImage.vue'
 import StepList from '../components/StepList.vue'
+import CollectionPermissions from '../components/CollectionPermissions.vue'
 import Usd from '../components/Usd.vue'
 
 const route = useRoute()
@@ -294,6 +295,9 @@ const tabs = [
           </table>
         </StateBlock>
       </Panel>
+
+      <CollectionPermissions v-if="isMine" :owner="profile.address"
+        :collections="[...(profile.owned ?? []), ...(profile.openOrders ?? [])]" @changed="load" />
 
       <p v-if="market.error.value" data-market-error class="text-[13px] text-[var(--color-danger)]">{{ market.error.value }}</p>
       <StepList :steps="market.steps.value" />

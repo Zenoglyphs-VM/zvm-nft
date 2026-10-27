@@ -11,6 +11,8 @@ export interface Call {
   to: Address
   data: Hex
   value: bigint
+  /** Recheck the selected account and node after asynchronous preparation. */
+  guard?: () => void
   /** A generous limit, used where estimating is impossible. */
   gas: bigint
   label: string
@@ -55,9 +57,11 @@ export async function runCalls(calls: Call[], update: (steps: Step[]) => void): 
   for (const [i, call] of calls.entries()) {
     const step = steps[i]
     try {
+      call.guard?.()
       step.state = 'signing'
       emit()
       const [gas, {maxFeePerGas, maxPriorityFeePerGas}] = await Promise.all([estimate(from, call), estimateFees(info.l2.chainId)])
+      call.guard?.()
       const hash = await signer.sendTransaction({to: call.to, data: call.data, value: call.value, gas, maxFeePerGas, maxPriorityFeePerGas})
       step.txHash = hash
       step.state = 'published'
