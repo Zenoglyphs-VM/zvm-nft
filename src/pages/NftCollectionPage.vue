@@ -24,7 +24,7 @@ import StepList from '../components/StepList.vue'
 import Usd from '../components/Usd.vue'
 
 const route = useRoute()
-const address = computed(() => String(route.params.collection))
+const address = computed(() => String(route.params.addr))
 const collection = ref<any>(null)
 const items = ref<any[]>([])
 const activity = ref<any[]>([])
@@ -90,7 +90,7 @@ onMounted(async () => {
   }, 20_000)
 })
 onBeforeUnmount(() => clearInterval(timer))
-watch(() => route.params.collection, () => {
+watch(() => route.params.addr, () => {
   loading.value = true
   activity.value = []
   load()
@@ -257,7 +257,7 @@ async function sweep() {
                     <Badge :tone="a.kind === 'sale' || a.kind === 'bid-accepted' ? 'good' : a.kind === 'list' ? 'info' : a.kind === 'offer' ? 'accent' : 'plain'">{{ a.kind }}</Badge>
                   </td>
                   <td class="td">
-                    <router-link v-if="a.tokenId" :to="`/nft/${collection.address}/${a.tokenId}`" class="link mono">#{{ a.tokenId }}</router-link>
+                    <router-link v-if="a.tokenId" :to="`/item/${collection.address}/${a.tokenId}`" class="link mono">#{{ a.tokenId }}</router-link>
                     <span v-else class="text-[var(--color-dim)]">collection</span>
                   </td>
                   <td class="td"><AddressLink :address="a.from" :length="6" /></td>

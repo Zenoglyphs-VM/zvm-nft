@@ -89,7 +89,7 @@ async function createCollection() {
     const receipt = await publicClient(wallet.info.l2.chainId).getTransactionReceipt({hash: hash as `0x${string}`})
     const created = collectionFromLogs(receipt.logs as any, to)
     if (created) {
-      router.push(`/nft/${created}`)
+      router.push(`/collection/${created}`)
       return
     }
   }
@@ -119,7 +119,7 @@ async function mint() {
   if (hash && wallet.info) {
     const receipt = await publicClient(wallet.info.l2.chainId).getTransactionReceipt({hash: hash as `0x${string}`})
     const id = mintedTokenId(receipt.logs as any, collection)
-    if (id !== null) router.push(`/nft/${collection}/${id}`)
+    if (id !== null) router.push(`/item/${collection}/${id}`)
   }
 }
 

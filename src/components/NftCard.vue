@@ -19,7 +19,7 @@ const label = computed(() => props.item.name || `#${props.item.tokenId}`)
 
 <template>
   <router-link
-    :to="`/nft/${collection}/${item.tokenId}`"
+    :to="`/item/${collection}/${item.tokenId}`"
     class="card overflow-hidden hover:border-[var(--color-line-strong)] transition-colors block"
   >
     <NftImage :src="item.image" :alt="label" :rounded="false" />

@@ -37,7 +37,7 @@ import StepList from '../components/StepList.vue'
 import Usd from '../components/Usd.vue'
 
 const route = useRoute()
-const collection = computed(() => String(route.params.collection))
+const collection = computed(() => String(route.params.addr))
 const tokenId = computed(() => String(route.params.id))
 const item = ref<any>(null)
 const loading = ref(true)
@@ -76,7 +76,7 @@ onMounted(() => {
   }, 15_000)
 })
 onBeforeUnmount(() => clearInterval(timer))
-watch(() => [route.params.collection, route.params.id], () => {
+watch(() => [route.params.addr, route.params.id], () => {
   loading.value = true
   item.value = null
   load()
@@ -211,7 +211,7 @@ function openPanel(which: 'list' | 'offer') {
         <Panel>
           <div class="p-4 grid gap-3">
             <div>
-              <router-link :to="`/nft/${item.collection}`" class="link text-[13px]">{{ collectionInfo?.name || 'Collection' }}</router-link>
+              <router-link :to="`/collection/${item.collection}`" class="link text-[13px]">{{ collectionInfo?.name || 'Collection' }}</router-link>
               <h1 class="text-[20px] font-semibold tracking-tight mt-0.5">{{ name }}</h1>
               <p class="text-[13px] text-[var(--color-dim)] mt-1">
                 Held by <AddressLink :address="item.owner" :length="8" />

@@ -60,7 +60,7 @@ function setSort(v: string) {
           Listings and offers are signatures, as on OpenSea and Blur: free to make, and many listings are one wallet prompt.
         </p>
       </div>
-      <router-link to="/nft/create" class="btn btn-plasma">Create</router-link>
+      <router-link to="/create" class="btn btn-plasma">Create</router-link>
     </div>
 
     <div class="grid gap-3 grid-cols-2 lg:grid-cols-4">
@@ -106,7 +106,7 @@ function setSort(v: string) {
             <tbody>
               <tr v-for="c in overview?.collections ?? []" :key="c.address">
                 <td class="td">
-                  <router-link :to="`/nft/${c.address}`" class="flex items-center gap-3 min-w-0">
+                  <router-link :to="`/collection/${c.address}`" class="flex items-center gap-3 min-w-0">
                     <div class="w-10 shrink-0"><NftImage :src="image(c)" :alt="c.name" /></div>
                     <div class="min-w-0">
                       <div class="font-medium truncate">{{ c.name || 'Unnamed collection' }}</div>
@@ -143,10 +143,10 @@ function setSort(v: string) {
             <tbody>
               <tr v-for="s in overview?.sales ?? []" :key="`${s.tx}-${s.index}`">
                 <td class="td w-12">
-                  <router-link :to="`/nft/${s.collection}/${s.tokenId}`"><NftImage :src="s.image" :alt="s.name" /></router-link>
+                  <router-link :to="`/item/${s.collection}/${s.tokenId}`"><NftImage :src="s.image" :alt="s.name" /></router-link>
                 </td>
                 <td class="td">
-                  <router-link :to="`/nft/${s.collection}/${s.tokenId}`" class="link">{{ s.name || `#${s.tokenId}` }}</router-link>
+                  <router-link :to="`/item/${s.collection}/${s.tokenId}`" class="link">{{ s.name || `#${s.tokenId}` }}</router-link>
                   <div class="text-[12px] text-[var(--color-dim)] truncate">{{ s.collectionName }} · {{ ago(s.timestamp) }}</div>
                 </td>
                 <td class="td text-right mono whitespace-nowrap">
@@ -167,10 +167,10 @@ function setSort(v: string) {
             <tbody>
               <tr v-for="l in overview?.listings ?? []" :key="l.hash">
                 <td class="td w-12">
-                  <router-link :to="`/nft/${l.collection}/${l.tokenId}`"><NftImage :src="l.image" :alt="l.name" /></router-link>
+                  <router-link :to="`/item/${l.collection}/${l.tokenId}`"><NftImage :src="l.image" :alt="l.name" /></router-link>
                 </td>
                 <td class="td">
-                  <router-link :to="`/nft/${l.collection}/${l.tokenId}`" class="link">{{ l.name || `#${l.tokenId}` }}</router-link>
+                  <router-link :to="`/item/${l.collection}/${l.tokenId}`" class="link">{{ l.name || `#${l.tokenId}` }}</router-link>
                   <div class="text-[12px] text-[var(--color-dim)] truncate">
                     {{ l.collectionName }} · by <AddressLink :address="l.seller" :length="6" />
                   </div>

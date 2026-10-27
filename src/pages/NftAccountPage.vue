@@ -190,10 +190,10 @@ const tabs = [
             <tbody>
               <tr v-for="c in profile.created" :key="c.address">
                 <td class="td w-14">
-                  <router-link :to="`/nft/${c.address}`"><NftImage :src="parseMeta(c.meta).image" :alt="c.name" /></router-link>
+                  <router-link :to="`/collection/${c.address}`"><NftImage :src="parseMeta(c.meta).image" :alt="c.name" /></router-link>
                 </td>
                 <td class="td">
-                  <router-link :to="`/nft/${c.address}`" class="link font-medium">{{ c.name || 'Unnamed' }}</router-link>
+                  <router-link :to="`/collection/${c.address}`" class="link font-medium">{{ c.name || 'Unnamed' }}</router-link>
                   <div class="text-[12px] text-[var(--color-dim)] mono">{{ c.symbol }}</div>
                 </td>
                 <td class="td text-right mono">{{ number(c.items) }} items</td>
@@ -208,10 +208,10 @@ const tabs = [
             <tbody>
               <tr v-for="l in profile.listings" :key="l.hash">
                 <td class="td w-14">
-                  <router-link :to="`/nft/${l.collection}/${l.tokenId}`"><NftImage :src="l.image" :alt="l.name" /></router-link>
+                  <router-link :to="`/item/${l.collection}/${l.tokenId}`"><NftImage :src="l.image" :alt="l.name" /></router-link>
                 </td>
                 <td class="td">
-                  <router-link :to="`/nft/${l.collection}/${l.tokenId}`" class="link">{{ l.name || `#${l.tokenId}` }}</router-link>
+                  <router-link :to="`/item/${l.collection}/${l.tokenId}`" class="link">{{ l.name || `#${l.tokenId}` }}</router-link>
                   <div class="text-[12px] text-[var(--color-dim)]">
                     {{ l.collectionName }}
                     <Badge v-if="l.kind === 1" tone="plain" class="ml-1" title="Signed together with other listings">bulk</Badge>
@@ -239,8 +239,8 @@ const tabs = [
                   <tbody>
                     <tr v-for="o in profile.offersMade ?? []" :key="`m${o.hash}`">
                       <td class="td">
-                        <router-link v-if="o.tokenId" :to="`/nft/${o.collection}/${o.tokenId}`" class="link mono">#{{ o.tokenId }}</router-link>
-                        <router-link v-else :to="`/nft/${o.collection}`" class="link">whole collection</router-link>
+                        <router-link v-if="o.tokenId" :to="`/item/${o.collection}/${o.tokenId}`" class="link mono">#{{ o.tokenId }}</router-link>
+                        <router-link v-else :to="`/collection/${o.collection}`" class="link">whole collection</router-link>
                         <div class="text-[12px] text-[var(--color-dim)]">{{ o.quantity - o.filled }} of {{ o.quantity }} left</div>
                       </td>
                       <td class="td text-right mono">{{ units(o.price, 18, 4) }} ZNN</td>
@@ -257,8 +257,8 @@ const tabs = [
                   <tbody>
                     <tr v-for="o in profile.offersReceived ?? []" :key="`r${o.hash}`">
                       <td class="td">
-                        <router-link v-if="o.tokenId" :to="`/nft/${o.collection}/${o.tokenId}`" class="link mono">#{{ o.tokenId }}</router-link>
-                        <router-link v-else :to="`/nft/${o.collection}`" class="link">whole collection</router-link>
+                        <router-link v-if="o.tokenId" :to="`/item/${o.collection}/${o.tokenId}`" class="link mono">#{{ o.tokenId }}</router-link>
+                        <router-link v-else :to="`/collection/${o.collection}`" class="link">whole collection</router-link>
                         <div class="text-[12px] text-[var(--color-dim)]">from <AddressLink :address="o.bidder" :length="6" /></div>
                       </td>
                       <td class="td text-right mono">{{ units(o.price, 18, 4) }} ZNN</td>
@@ -277,7 +277,7 @@ const tabs = [
               <tr v-for="(a, i) in profile.activity" :key="i">
                 <td class="td"><Badge :tone="a.kind === 'sale' || a.kind === 'bid-accepted' ? 'good' : a.kind === 'list' ? 'info' : a.kind === 'offer' ? 'accent' : 'plain'">{{ a.kind }}</Badge></td>
                 <td class="td">
-                  <router-link v-if="a.tokenId" :to="`/nft/${a.collection}/${a.tokenId}`" class="link mono">#{{ a.tokenId }}</router-link>
+                  <router-link v-if="a.tokenId" :to="`/item/${a.collection}/${a.tokenId}`" class="link mono">#{{ a.tokenId }}</router-link>
                   <AddressLink v-else :address="a.collection" :length="6" />
                 </td>
                 <td class="td"><AddressLink :address="a.from" :length="6" /></td>
