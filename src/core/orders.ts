@@ -205,12 +205,10 @@ function orderSide(value: unknown): number {
   return value
 }
 
-// The current node API represents these uint64 fields as JSON numbers. Refuse
-// values that cannot survive that transport instead of rounding signed bytes.
-function wireTime(value: bigint, field: string): number {
+// Keep legacy safe numbers; decimal strings carry the rest of uint64 exactly.
+function wireTime(value: bigint, field: string): number | string {
   const exact = orderUint(value, 64, field)
-  if (exact > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error(field + ': exact timestamp exceeds the legacy numeric API')
-  return Number(exact)
+  return exact <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(exact) : exact.toString()
 }
 
 const toWire = (value: Order) => {

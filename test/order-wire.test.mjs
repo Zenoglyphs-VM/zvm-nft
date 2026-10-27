@@ -32,6 +32,9 @@ async function fixture() {
   const api = {submitOrders: async (inputs) => {
     calls.api.push(JSON.parse(JSON.stringify(inputs)))
     return {results: inputs.map(() => ({ok: true}))}
+  }, order: async () => {
+    assert.ok(calls.reply, 'no explicit order-read capability was provided')
+    return calls.reply
   }}
   const evm = {publicClient: forbidden, walletClient: () => ({signTypedData: async (request) => {
     calls.prompts.push(request)
@@ -144,14 +147,30 @@ for (const value of [2, '0', null]) check('wire refuses invalid side ' + typeof 
   refused(() => f.module.fromWire({...base(), side: value}))
 })
 
-for (const key of uint64) check('wire refuses lossy outbound timestamp ' + key + ' before API submission', true, async () => {
+for (const key of uint64) check('wire submits full-width timestamp ' + key + ' without rounding', true, async () => {
   const f = await fixture(), order = f.module.fromWire(base())
-  order[key] = 9007199254740993n
-  let error
-  try { await f.module.submitOrders([{order, kind: 0, signature: '0x', proof: []}]) } catch (caught) { error = caught }
-  assert.ok(error, 'the API received a rounded timestamp from an exact bigint')
-  assert.doesNotMatch(String(error), /UNEXPECTED_CAPABILITY/)
-  assert.equal(f.calls.api.length, 0)
+  for (const exact of [9007199254740993n, 9223372036854775807n, 9223372036854775808n, 18446744073709551615n]) {
+    order[key] = exact
+    const before = order[key]
+    await f.module.submitOrders([{order, kind: 0, signature: '0x', proof: []}])
+    const sent = f.calls.api.at(-1)[0].order
+    assert.equal(sent[key], exact.toString())
+    assert.equal(order[key], before)
+    assert.equal(f.module.fromWire(sent)[key], exact)
+  }
+  assert.equal(f.calls.api.length, 4)
+  assert.equal(f.calls.prompts.length, 0)
+})
+
+check('wire fetches a fillable full-width input for exact ABI use', false, async () => {
+  const f = await fixture(), order = {...base(), listingTime: '9007199254740993', expirationTime: '18446744073709551615'}
+  f.calls.reply = {fillable: true, input: {order, kind: 1, signature: '0x1234', proof: ['0x' + 'a'.repeat(64)]}}
+  const input = await f.module.fetchInput('0x' + 'b'.repeat(64))
+  assert.equal(input.order.listingTime, 9007199254740993n)
+  assert.equal(input.order.expirationTime, 18446744073709551615n)
+  assert.equal(input.signature, '0x1234')
+  assert.equal(input.proof[0], '0x' + 'a'.repeat(64))
+  assert.equal(f.calls.api.length + f.calls.prompts.length, 0)
 })
 
 check('wire empty tree matches the Go zero root', true, async () => {

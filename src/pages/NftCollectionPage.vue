@@ -8,7 +8,7 @@ import {parseUnits, type Address} from 'viem'
 import {api} from '../core/api'
 import {wallet} from '../core/wallet'
 import {publicClient} from '../core/evm'
-import {ago, number, units} from '../core/format'
+import {ago, number, orderExpiry, units} from '../core/format'
 import {collectionAbi, currencyOf, isZero, parseMeta} from '../core/nft'
 import {exchangeAddress, sameAddress, useMarket} from '../core/market'
 import {bidFunding, BUY, buyManyCall, exchange, fetchFillable, newOrder, signOrder, submitOrders} from '../core/orders'
@@ -292,7 +292,7 @@ async function sweep() {
                   <div class="text-[12px]"><Usd :amount="o.price" :decimals="18" token="znn" /></div>
                 </td>
                 <td class="td text-right mono">{{ o.quantity - o.filled }} of {{ o.quantity }}</td>
-                <td class="td text-[12.5px] text-[var(--color-dim)]">{{ ago(o.expiry) === '0s ago' ? 'expired' : new Date(o.expiry * 1000).toLocaleDateString() }}</td>
+                <td class="td text-[12.5px] text-[var(--color-dim)]">{{ orderExpiry(o.expiry) }}</td>
               </tr>
             </tbody>
           </table>

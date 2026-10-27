@@ -9,7 +9,7 @@ import {parseUnits, type Address} from 'viem'
 import {api} from '../core/api'
 import {wallet} from '../core/wallet'
 import {publicClient} from '../core/evm'
-import {ago, number, short, units} from '../core/format'
+import {ago, number, orderDate, short, units} from '../core/format'
 import {mediaURL} from '../core/media'
 import {currencyOf, isZero, NATIVE, parseMeta} from '../core/nft'
 import {exchangeAddress, sameAddress, useMarket} from '../core/market'
@@ -230,7 +230,7 @@ function openPanel(which: 'list' | 'offer') {
                   <div class="text-[13px]">
                     <Usd :amount="listing.price" :decimals="listingCurrency.decimals" :token="listingCurrency.key" />
                     <span class="text-[var(--color-dim)]"> · listed by </span><AddressLink :address="listing.seller" :length="6" />
-                    <span class="text-[var(--color-dim)]"> · until {{ new Date(listing.expiry * 1000).toLocaleDateString() }}</span>
+                    <span class="text-[var(--color-dim)]"> · until {{ orderDate(listing.expiry) }}</span>
                   </div>
                 </div>
                 <div class="flex flex-wrap gap-2">
@@ -299,7 +299,7 @@ function openPanel(which: 'list' | 'offer') {
                     <div class="text-[12px]"><Usd :amount="o.price" :decimals="18" token="znn" /></div>
                   </td>
                   <td class="td"><AddressLink :address="o.bidder" :length="6" /></td>
-                  <td class="td text-[12.5px] text-[var(--color-dim)]">until {{ new Date(o.expiry * 1000).toLocaleDateString() }}</td>
+                  <td class="td text-[12.5px] text-[var(--color-dim)]">until {{ orderDate(o.expiry) }}</td>
                   <td class="td text-right">
                     <button v-if="isOwner" class="btn px-2.5 py-1 text-[12.5px]" :disabled="market.busy.value" @click="accept(o)">Accept</button>
                     <button

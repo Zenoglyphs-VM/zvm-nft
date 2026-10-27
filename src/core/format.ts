@@ -4,3 +4,5 @@
 // `configure` in main.ts.
 
 export * from '@zvm/web/format'
+
+export {orderDate, orderExpiry} from './order-time'
