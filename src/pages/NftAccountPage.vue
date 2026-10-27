@@ -23,6 +23,7 @@ import NftCard from '../components/NftCard.vue'
 import NftImage from '../components/NftImage.vue'
 import StepList from '../components/StepList.vue'
 import CollectionPermissions from '../components/CollectionPermissions.vue'
+import ExchangeCredits from '../components/ExchangeCredits.vue'
 import Usd from '../components/Usd.vue'
 
 const route = useRoute()
@@ -122,6 +123,7 @@ const tabs = [
 <template>
   <StateBlock :loading="loading" :error="error">
     <div v-if="profile" class="grid gap-4">
+      <ExchangeCredits :owner="address" />
       <Panel>
         <div class="p-4 flex flex-wrap items-center gap-3">
           <div>
