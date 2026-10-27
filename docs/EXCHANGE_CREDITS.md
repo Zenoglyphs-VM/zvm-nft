@@ -91,3 +91,55 @@ controls alone do not complete that acceptance or establish production readiness
 
 References: [EIP-1193](https://eips.ethereum.org/EIPS/eip-1193),
 [Web Locks](https://w3c.github.io/web-locks/).
+
+
+## Wallet call recovery
+
+New withdrawals discover Wallet Call API capabilities only after the connected
+owner chooses to withdraw, and query only that account and chain. A wallet that
+advertises a chain-specific atomic capability can use the version 2.0.0
+[Wallet Call API](https://eips.ethereum.org/EIPS/eip-5792). A single native-credit
+call needs no atomic upgrade; the request sets `atomicRequired: false`.
+
+The application generates an unpredictable 64-byte id and durably saves that id,
+the exact `wallet_sendCalls` payload, chain origin, owner, exchange, canonical
+preparation anchor and original nonce before calling the provider. Its separate
+bounded journal leaves schema-1 withdrawal bytes unchanged. Both journals share
+one exclusion lock and a combined 32-record limit. Any unresolved older record
+blocks either sending protocol. Unsupported discovery can select the legacy
+method before dispatch. After dispatch there is no fallback, resubmission, new id
+or replacement signature, including after a lost response or a timeout.
+
+Recovery queries only `wallet_getCallsStatus` for the saved id. The exact id,
+version and chain must match. All returned receipt hashes remain in a bounded
+observation history; later results cannot silently discard an earlier hash.
+Every receipt, inclusion order and relevant reported log is checked against the
+canonical node. A missing or orphaned receipt keeps the whole group pending.
+Removal and restoration never send the call again. Wallet-reported inner failure
+is distinct from a successful outer transaction receipt. A partial failure needs
+review; an offchain failure is displayed as the wallet's assertion that nothing
+was included and it will not retry. It does not start another request.
+
+Credit is always read independently from the exchange at a canonical block hash.
+Wallet association and inner-call outcome remain wallet assertions; canonical
+outer receipts alone do not prove inner execution. Unknown, malformed, expired,
+conflicting or incomplete status cannot clear an unresolved request. Already
+retained complete receipts can still be checked after wallet status expires.
+There is no indefinite wallet-status availability guarantee. Legacy transactions
+whose outer hash was never returned still require the original wallet's review.
+
+Each wallet journal is limited to 64 KiB, each record to eight distinct status
+observations, and each group to 16 receipts with bounded log data. History is
+never trimmed automatically. Persistence failure keeps known recovery details
+visible and exportable while another withdrawal stays blocked. Provider, account,
+chain and endpoint generation changes fence late responses.
+
+The recovery model has explicit synthetic provider, storage and canonical-node
+controls. Real browser, wallet account, official relayer and EVM execution for
+this new protocol require separate evidence at the exact new UI revisions.
+Existing browser runs retain their original source pins. Generic Safe, ERC-4337,
+physical-wallet support and full marketplace acceptance are not established by
+these model controls or a successful frontend build.
+
+If saved and unsaved wallet observations diverge between pages, neither version
+is overwritten. A partial recovery export retains both versions for review.

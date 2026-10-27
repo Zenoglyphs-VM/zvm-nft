@@ -1,4 +1,7 @@
 import type {CreditRead, CreditRpc} from './credit-rpc'
+import {walletJournalKey, readWalletJournal, walletRequest, supportsWalletCalls, walletMethodUnsupported,
+  boundedWalletRequest, parseWalletResult, appendWalletResult, walletResultComplete, walletQuantity, sameWalletLog,
+  WALLET_CALL_JOURNAL_BYTES, WALLET_CALL_RESULTS, type CreditWallet, type WalletWithdrawalRecord} from './credit-wallet'
 
 export const CREDIT_HISTORY_LIMIT = 32
 export const CREDIT_JOURNAL_BYTES = 64 * 1024
@@ -16,7 +19,7 @@ export interface CreditContext {
   endpointHash: string
   rpc: CreditRpc
 }
-export interface WithdrawalRecord {
+export interface LegacyWithdrawalRecord {
   id: string
   chainId: number
   owner: string
@@ -31,6 +34,7 @@ export interface WithdrawalRecord {
   hash: string | null
   source: 'wallet' | 'recovered'
 }
+export type WithdrawalRecord = LegacyWithdrawalRecord | WalletWithdrawalRecord
 export interface CreditCall {
   to: `0x${string}`
   data: `0x${string}`
@@ -44,7 +48,8 @@ export interface CreditCall {
 }
 export interface CreditEntry {
   record: WithdrawalRecord
-  state: 'unknown' | 'pending' | 'executed' | 'reverted' | 'other-context'
+  state: 'unknown' | 'pending' | 'executed' | 'reverted' | 'not-submitted' | 'other-context'
+  note?: string
 }
 export interface CreditView {
   amount: bigint | null
@@ -61,6 +66,7 @@ export interface CreditCapabilities {
   exclusive: (key: string, action: () => Promise<void>) => Promise<void>
   canSend: (context: CreditContext) => boolean
   send: (call: CreditCall) => Promise<void>
+  wallet?: (context: CreditContext) => CreditWallet | null
   readData: (owner: string) => string
   withdrawData: string
   id: () => string
@@ -89,7 +95,7 @@ function checkedContext(value: CreditContext): CreditContext {
 export function creditJournalKey(context: Pick<CreditContext, 'chainId' | 'owner' | 'exchange'>): string {
   return 'zvm.exchange-credits.v1:' + context.chainId + ':' + context.exchange.toLowerCase() + ':' + context.owner.toLowerCase()
 }
-export function readCreditJournal(raw: string | null, context: CreditContext, data: string): WithdrawalRecord[] {
+export function readCreditJournal(raw: string | null, context: CreditContext, data: string): LegacyWithdrawalRecord[] {
   if (raw === null) return []
   if (raw.length > CREDIT_JOURNAL_BYTES) throw new CreditFault('Saved withdrawal history exceeds its read limit. Keep it for review.')
   let parsed: any
@@ -123,7 +129,8 @@ export function walletRejected(error: unknown): boolean {
   }
   return false
 }
-const terminal = (entry: CreditEntry) => entry.state === 'executed' || entry.state === 'reverted'
+const terminal = (entry: CreditEntry) => entry.state === 'executed' || entry.state === 'reverted' || entry.state === 'not-submitted'
+const copyRecord = (row: WithdrawalRecord): WithdrawalRecord => JSON.parse(JSON.stringify(row))
 
 export class CreditController {
   private context: CreditContext | null = null
@@ -145,12 +152,12 @@ export class CreditController {
   snapshot(): CreditView {
     const ctx = this.context
     const unsaved = !!ctx && [...this.unsaved.values()].some(r => creditJournalKey(r) === creditJournalKey(ctx))
-    const entries = this.value.entries.map(e => ({...e, record: {...e.record}}))
+    const entries = this.value.entries.map(e => ({...e, record: copyRecord(e.record)}))
     if (ctx) for (const pending of this.unsaved.values()) {
       if (creditJournalKey(pending) !== creditJournalKey(ctx)) continue
       const entry = entries.find(e => e.record.id === pending.id)
-      if (entry) {entry.record = {...pending}; entry.state = 'pending'}
-      else entries.push({record: {...pending}, state: 'pending'})
+      if (entry) {entry.record = copyRecord(pending); entry.state = 'pending'}
+      else entries.push({record: copyRecord(pending), state: 'pending'})
     }
     return {...this.value, busy: this.busy, unsaved,
       canWithdraw: !!ctx && !this.busy && !this.value.loading && !this.value.error && !unsaved &&
@@ -174,16 +181,29 @@ export class CreditController {
       throw new CreditFault('The account or network changed. Review the credit again.')
   }
   private records(context: CreditContext): WithdrawalRecord[] {
-    const rows = readCreditJournal(this.capabilities.storage.getItem(creditJournalKey(context)), context, this.capabilities.withdrawData)
+    const rows: WithdrawalRecord[] = [...readCreditJournal(this.capabilities.storage.getItem(creditJournalKey(context)), context, this.capabilities.withdrawData),
+      ...readWalletJournal(this.capabilities.storage.getItem(walletJournalKey(context)), context, this.capabilities.withdrawData)]
+    if (rows.length > CREDIT_HISTORY_LIMIT || new Set(rows.map(row => row.id)).size !== rows.length)
+      throw new CreditFault('Combined withdrawal history needs review before continuing.')
     for (const pending of this.unsaved.values()) {
       if (creditJournalKey(pending) !== creditJournalKey(context)) continue
       const row = rows.find(r => r.id === pending.id)
       if (!row || (row.hash !== null && row.hash !== pending.hash)) throw new CreditFault('The saved recovery record changed. Keep the original transaction hash.')
-      Object.assign(row, pending)
+      if (row.source === 'wallet-calls' || pending.source === 'wallet-calls') {
+        if (row.source !== 'wallet-calls' || pending.source !== 'wallet-calls' ||
+          JSON.stringify(row.wallet.request) !== JSON.stringify(pending.wallet.request))
+          throw new CreditFault('The original wallet call request changed. Keep its saved identifier.')
+        const stable = (value: WalletWithdrawalRecord) => JSON.stringify({...value, wallet: {...value.wallet, results: []}})
+        if (stable(row) !== stable(pending) || row.wallet.results.slice(0, Math.min(row.wallet.results.length, pending.wallet.results.length))
+          .some((result, index) => JSON.stringify(result) !== JSON.stringify(pending.wallet.results[index])))
+          throw new CreditFault('Saved and unsaved wallet observations diverged. Download both versions for review.')
+        if (row.wallet.results.length > pending.wallet.results.length) continue
+      }
+      Object.assign(row, copyRecord(pending))
     }
     return rows
   }
-  private write(context: CreditContext, rows: WithdrawalRecord[], expected: string | null) {
+  private write(context: CreditContext, rows: LegacyWithdrawalRecord[], expected: string | null) {
     const key = creditJournalKey(context)
     const raw = JSON.stringify({schema: 1, records: rows})
     readCreditJournal(raw, context, this.capabilities.withdrawData)
@@ -192,7 +212,106 @@ export class CreditController {
     this.capabilities.storage.setItem(key, raw)
     if (this.capabilities.storage.getItem(key) !== raw) throw new CreditFault('The withdrawal recovery record could not be verified.')
   }
-  private async inspect(context: CreditContext, row: WithdrawalRecord, genesis: string, head: Block, read: CreditRead): Promise<CreditEntry> {
+  private writeWallet(context: CreditContext, rows: WalletWithdrawalRecord[], expected: string | null) {
+    const key = walletJournalKey(context), raw = JSON.stringify({schema: 1, records: rows})
+    readWalletJournal(raw, context, this.capabilities.withdrawData)
+    if (raw.length > WALLET_CALL_JOURNAL_BYTES || this.capabilities.storage.getItem(key) !== expected)
+      throw new CreditFault('Wallet recovery history changed or is full. Keep the original request identifier.')
+    this.capabilities.storage.setItem(key, raw)
+    if (this.capabilities.storage.getItem(key) !== raw) throw new CreditFault('The wallet recovery record could not be verified.')
+  }
+  private async selectWallet(context: CreditContext, generation: number): Promise<CreditWallet | null> {
+    const wallet = this.capabilities.wallet?.(context)
+    if (!wallet) return null
+    try {
+      const capabilities = await boundedWalletRequest(wallet, 'wallet_getCapabilities', [context.owner, [hex(BigInt(context.chainId))]])
+      this.guard(context, generation)
+      if (!this.capabilities.canSend(context)) throw new CreditFault('The connected wallet changed during preparation.')
+      return supportsWalletCalls(capabilities, context.chainId) ? wallet : null
+    } catch (error) {
+      this.guard(context, generation)
+      if (walletMethodUnsupported(error)) return null
+      throw new CreditFault('Wallet capabilities could not be checked. Refresh before preparing another withdrawal.')
+    }
+  }
+  private async sendWallet(context: CreditContext, generation: number, snapshot: Snapshot, base: LegacyWithdrawalRecord, wallet: CreditWallet) {
+    this.guard(context, generation)
+    if (!this.capabilities.canSend(context)) throw new CreditFault('The connected wallet changed before submission.')
+    if (JSON.stringify(this.records(context)) !== JSON.stringify(snapshot.entries.map(entry => entry.record)))
+      throw new CreditFault('Withdrawal history changed during wallet preparation.')
+    const record: WalletWithdrawalRecord = {...base, source: 'wallet-calls', wallet: {
+      request: walletRequest(context, base.data, wallet.id()), results: []}}
+    const key = walletJournalKey(context), raw = this.capabilities.storage.getItem(key)
+    const rows = readWalletJournal(raw, context, this.capabilities.withdrawData)
+    this.writeWallet(context, [...rows, record], raw)
+    this.value.entries = [...snapshot.entries, {record: copyRecord(record), state: 'unknown'}]
+    this.emit()
+    // The complete caller-generated id and exact request are durable before the
+    // provider sees a send. Any response loss is resolved only by this same id.
+    const response: any = await boundedWalletRequest(wallet, 'wallet_sendCalls', [JSON.parse(JSON.stringify(record.wallet.request))], 60000)
+    this.guard(context, generation)
+    if (!response || typeof response !== 'object' || Array.isArray(response) || response.id !== record.wallet.request.id)
+      throw new CreditFault('The wallet response did not identify the saved request. Review its status without sending again.')
+    this.value.note = 'The wallet accepted this request identifier. Its status and canonical receipts are checked without sending it again.'
+  }
+  private async inspectWallet(context: CreditContext, generation: number, original: WalletWithdrawalRecord, genesis: string, head: Block, read: CreditRead): Promise<CreditEntry> {
+    if (!equal(original.genesis, genesis)) return {record: original, state: 'other-context'}
+    let record = original, note = ''
+    if (read.signal.aborted) throw new CreditFault('The credit read timed out. Refresh before reviewing the request.')
+    const wallet = this.capabilities.canSend(context) && record.wallet.results.length < WALLET_CALL_RESULTS ? this.capabilities.wallet?.(context) : null
+    if (wallet) {
+      let response: unknown, received = false
+      try {
+        response = await boundedWalletRequest(wallet, 'wallet_getCallsStatus', [record.wallet.request.id])
+        this.guard(context, generation)
+        if (!this.capabilities.canSend(context)) throw new CreditFault('The wallet context changed during recovery.')
+        received = true
+      } catch {
+        this.guard(context, generation)
+        // Only retained, already associated receipts may remain useful after a
+        // wallet forgets an id. An unknown id never authorizes another send.
+        note = 'Current wallet status is unavailable. Retained receipts are checked; keep this original request identifier.'
+        if (!this.capabilities.canSend(context) || !record.wallet.results.length) return {record, state: 'unknown', note}
+      }
+      if (received) {
+        try {
+          record = appendWalletResult(record, parseWalletResult(response, record.wallet.request, context.chainId))
+          if (JSON.stringify(record) !== JSON.stringify(original)) this.unsaved.set(record.id, copyRecord(record))
+        } catch {
+          return {record, state: 'unknown', note: 'The wallet returned conflicting or invalid recovery details. Keep the original request identifier.'}
+        }
+      }
+    }
+    if (read.signal.aborted) throw new CreditFault('The credit read timed out. Retain the wallet recovery details.')
+    const latest = record.wallet.results[record.wallet.results.length - 1]
+    if (!latest || !walletResultComplete(record)) return {record, state: 'unknown', note: note || 'The complete wallet receipt group is unresolved.'}
+    if (latest.status === 400) return {record, state: 'not-submitted', note: 'The wallet reports that this request was not included and will not be retried.'}
+    let previous: {number: bigint; index: bigint} | null = null
+    for (const claim of latest.receipts) {
+      const receipt: any = await context.rpc('eth_getTransactionReceipt', [claim.transactionHash], read)
+      this.guard(context, generation)
+      if (receipt === null) return {record, state: 'pending', note}
+      if (!receipt || typeof receipt.transactionHash !== 'string' || !HASH.test(receipt.transactionHash) ||
+        !equal(receipt.transactionHash, claim.transactionHash) || typeof receipt.blockHash !== 'string' || !HASH.test(receipt.blockHash) ||
+        !['0x0','0x1'].includes(receipt.status) || !Array.isArray(receipt.logs)) throw new CreditFault('A wallet-associated canonical receipt is invalid.')
+      const number = quantity(receipt.blockNumber), index = walletQuantity(receipt.transactionIndex)
+      if (number > head.number || number !== walletQuantity(claim.blockNumber) || !equal(receipt.blockHash, claim.blockHash) ||
+        receipt.status !== claim.status || walletQuantity(receipt.gasUsed) !== walletQuantity(claim.gasUsed) ||
+        claim.logs.some(log => !receipt.logs.some((actual: unknown) => sameWalletLog(actual, log))))
+        return {record, state: 'pending', note: 'A retained wallet receipt does not match the current canonical node receipt.'}
+      const canonical = block(await context.rpc('eth_getBlockByNumber', [hex(number), false], read))
+      this.guard(context, generation)
+      if (canonical.number !== number || !equal(canonical.hash, receipt.blockHash)) return {record, state: 'pending', note}
+      if (previous && (number < previous.number || (number === previous.number && index <= previous.index)))
+        return {record, state: 'unknown', note: 'Wallet receipts are not in their canonical inclusion order.'}
+      previous = {number, index}
+    }
+    if (latest.status === 100) return {record, state: 'pending', note}
+    if (latest.status === 600) return {record, state: 'unknown', note: 'The wallet reports a partial failure. Review every retained receipt before another request.'}
+    return {record, state: latest.status === 200 ? 'executed' : 'reverted',
+      note: note || 'Wallet-reported completion and every canonical receipt were checked. Available exchange credit was read independently.'}
+  }
+  private async inspect(context: CreditContext, row: LegacyWithdrawalRecord, genesis: string, head: Block, read: CreditRead): Promise<CreditEntry> {
     if (!equal(row.genesis, genesis)) return {record: row, state: 'other-context'}
     if (!row.hash) return {record: row, state: 'unknown'}
     const receipt: any = await context.rpc('eth_getTransactionReceipt', [row.hash], read)
@@ -209,14 +328,14 @@ export class CreditController {
     if (row.source === 'recovered') await this.exactTransaction(context, row, row.hash, read)
     return {record: row, state: receipt.status === '0x1' ? 'executed' : 'reverted'}
   }
-  private async exactTransaction(context: CreditContext, row: WithdrawalRecord, hash: string, read: CreditRead) {
+  private async exactTransaction(context: CreditContext, row: LegacyWithdrawalRecord, hash: string, read: CreditRead) {
     const tx: any = await context.rpc('eth_getTransactionByHash', [hash], read)
     if (!tx || !equal(String(tx.hash), hash) || !equal(String(tx.from), row.owner) || !equal(String(tx.to), row.exchange) ||
       typeof tx.input !== 'string' || !equal(tx.input, row.data) || quantity(tx.value) !== 0n || quantity(tx.nonce) < BigInt(row.nonce) ||
       (tx.chainId !== undefined && quantity(tx.chainId) !== BigInt(context.chainId)))
       throw new CreditFault('This hash does not identify the original withdrawal call. Keep the request for wallet review.')
   }
-  private async load(context: CreditContext, generation: number): Promise<Snapshot> {
+  private async load(context: CreditContext, generation: number, locked = false): Promise<Snapshot> {
     const abort = new AbortController()
     this.abort = abort
     const timer = setTimeout(() => abort.abort(), 30000)
@@ -228,6 +347,7 @@ export class CreditController {
       return result
     }
     try {
+      const walletBefore = this.capabilities.storage.getItem(walletJournalKey(context))
       const rows = this.records(context)
       if (quantity(await rpc('eth_chainId', [])) !== BigInt(context.chainId)) throw new CreditFault('This node serves a different chain.')
       const genesis = block(await rpc('eth_getBlockByNumber', ['0x0', false]))
@@ -253,10 +373,11 @@ export class CreditController {
           if (index >= rows.length) return
           const row = rows[index], input = JSON.stringify(row)
           const cached = previous?.proofs.get(row.id)
-          const entry = cached?.input === input ? {...cached.entry, record: row} : await this.inspect(context, row, genesis.hash, head, read)
+          const entry = row.source === 'wallet-calls' ? await this.inspectWallet(context, generation, row, genesis.hash, head, read)
+            : cached?.input === input ? {...cached.entry, record: row} : await this.inspect(context, row, genesis.hash, head, read)
           this.guard(context, generation)
           entries[index] = entry
-          if (terminal(entry)) proofs.set(row.id, {input, entry})
+          if (terminal(entry) && row.source !== 'wallet-calls') proofs.set(row.id, {input, entry})
         }
       }
       await Promise.all(Array.from({length: Math.min(4, rows.length)}, worker))
@@ -264,8 +385,36 @@ export class CreditController {
       if (end.number !== head.number || !equal(end.hash, head.hash) || quantity(await rpc('eth_chainId', [])) !== BigInt(context.chainId))
         throw new CreditFault('The canonical credit view changed. Refresh before withdrawing.')
       this.guard(context, generation)
+      const walletRows = entries.filter(entry => entry.record.source === 'wallet-calls').map(entry => entry.record as WalletWithdrawalRecord)
+      if (JSON.stringify(walletRows) !== JSON.stringify(readWalletJournal(walletBefore, context, this.capabilities.withdrawData))) {
+        for (const row of walletRows) this.unsaved.set(row.id, copyRecord(row))
+        const save = async () => {
+          this.guard(context, generation)
+          this.writeWallet(context, walletRows, walletBefore)
+          for (const row of walletRows) this.unsaved.delete(row.id)
+        }
+        if (locked) await save()
+        else await this.capabilities.exclusive(creditJournalKey(context), save)
+      }
       this.cache = {key: creditJournalKey(context), genesis: genesis.hash, head, proofs}
       return {amount, nonce, genesis: genesis.hash, head, entries}
+    } catch (error) {
+      // Preserve a newly learned receipt group even when its node proof is
+      // temporarily unavailable. Persistence never upgrades it to execution.
+      if (this.generation === generation && !this.disposed && [...this.unsaved.values()].some(row => row.source === 'wallet-calls' && creditJournalKey(row) === creditJournalKey(context))) {
+        try {
+          const save = async () => {
+            this.guard(context, generation)
+            const raw = this.capabilities.storage.getItem(walletJournalKey(context))
+            const rows = this.records(context).filter(row => row.source === 'wallet-calls') as WalletWithdrawalRecord[]
+            this.writeWallet(context, rows, raw)
+            for (const row of rows) this.unsaved.delete(row.id)
+          }
+          if (locked) await save()
+          else await this.capabilities.exclusive(creditJournalKey(context), save)
+        } catch { /* unsaved details remain visible and exportable */ }
+      }
+      throw error
     } finally {
       clearTimeout(timer)
       abort.abort()
@@ -306,20 +455,27 @@ export class CreditController {
     try {
       await this.capabilities.exclusive(creditJournalKey(context), async () => {
         this.guard(context, generation)
-        const snapshot = await this.load(context, generation)
+        const snapshot = await this.load(context, generation, true)
         if (snapshot.amount === 0n || !snapshot.entries.every(terminal) || !this.capabilities.canSend(context))
           throw new CreditFault('Review the credit and any earlier withdrawal before continuing.')
         const key = creditJournalKey(context)
         const raw = this.capabilities.storage.getItem(key)
         const rows = readCreditJournal(raw, context, this.capabilities.withdrawData)
-        if (JSON.stringify(rows) !== JSON.stringify(snapshot.entries.map(entry => entry.record)))
+        if (JSON.stringify(this.records(context)) !== JSON.stringify(snapshot.entries.map(entry => entry.record)))
           throw new CreditFault('Withdrawal history changed during preparation. Review it again.')
-        if (rows.length >= CREDIT_HISTORY_LIMIT) throw new CreditFault('Withdrawal history is full. Export and review it before continuing.')
-        const record: WithdrawalRecord = {id: this.capabilities.id(), chainId: context.chainId,
+        if (snapshot.entries.length >= CREDIT_HISTORY_LIMIT) throw new CreditFault('Withdrawal history is full. Export and review it before continuing.')
+        const record: LegacyWithdrawalRecord = {id: this.capabilities.id(), chainId: context.chainId,
           owner: context.owner, exchange: context.exchange, endpointHash: context.endpointHash,
           genesis: snapshot.genesis, head: snapshot.head.number.toString(), headHash: snapshot.head.hash,
           nonce: snapshot.nonce.toString(), data: this.capabilities.withdrawData, value: '0', hash: null, source: 'wallet'}
         const guard = () => {this.guard(context, generation); if (!this.capabilities.canSend(context)) throw new CreditFault('The wallet or network changed. Review the withdrawal again.')}
+        guard()
+        if (snapshot.entries.some(entry => entry.record.id === record.id)) throw new CreditFault('The recovery identifier is already in use.')
+        const wallet = await this.selectWallet(context, generation)
+        if (wallet) {
+          await this.sendWallet(context, generation, snapshot, record, wallet)
+          return
+        }
         let saved = false
         const failed = (error: unknown, requested: boolean) => {
           if (record.hash !== null || (requested && !walletRejected(error))) return
@@ -371,10 +527,10 @@ export class CreditController {
     this.emit()
     try {
       await this.capabilities.exclusive(creditJournalKey(context), async () => {
-        const snapshot = await this.load(context, generation)
+        const snapshot = await this.load(context, generation, true)
         const key = creditJournalKey(context), raw = this.capabilities.storage.getItem(key)
         const rows = readCreditJournal(raw, context, this.capabilities.withdrawData)
-        if (JSON.stringify(rows) !== JSON.stringify(snapshot.entries.map(entry => entry.record)))
+        if (JSON.stringify(this.records(context)) !== JSON.stringify(snapshot.entries.map(entry => entry.record)))
           throw new CreditFault('Withdrawal history changed during recovery. Review it again.')
         const row = rows.find(entry => entry.id === id)
         if (!row || row.hash !== null || !equal(row.genesis, snapshot.genesis) || rows.some(entry => entry.hash && equal(entry.hash, hash)))
@@ -400,7 +556,10 @@ export class CreditController {
         this.guard(context, generation)
         const key = creditJournalKey(context), raw = this.capabilities.storage.getItem(key)
         const rows = this.records(context)
-        this.write(context, rows, raw)
+        if (rows.some(row => row.source !== 'wallet-calls' && this.unsaved.has(row.id)))
+          this.write(context, rows.filter(row => row.source !== 'wallet-calls') as LegacyWithdrawalRecord[], raw)
+        if (rows.some(row => row.source === 'wallet-calls' && this.unsaved.has(row.id)))
+          this.writeWallet(context, rows.filter(row => row.source === 'wallet-calls') as WalletWithdrawalRecord[], this.capabilities.storage.getItem(walletJournalKey(context)))
         for (const row of rows) this.unsaved.delete(row.id)
       })
     } catch {this.value.note = 'The transaction hash still could not be saved. Download the recovery record before leaving.'}
@@ -408,10 +567,29 @@ export class CreditController {
   }
   exportRecord(): string {
     if (!this.context) return ''
-    try {return JSON.stringify({schema: 1, records: this.records(this.context)}, null, 2)} catch {
+    try {
+      const rows = this.records(this.context)
+      if (rows.some(row => row.source === 'wallet-calls')) return JSON.stringify({schema: 2,
+        legacy: {schema: 1, records: rows.filter(row => row.source !== 'wallet-calls')},
+        walletCalls: {schema: 1, records: rows.filter(row => row.source === 'wallet-calls')}}, null, 2)
+      return JSON.stringify({schema: 1, records: rows}, null, 2)
+    } catch {
       const pending = [...this.unsaved.values()].filter(row => creditJournalKey(row) === creditJournalKey(this.context!))
+      if (pending.some(row => row.source === 'wallet-calls')) {
+        let persistedWalletCallsRaw: string | null = null
+        try {
+          const raw = this.capabilities.storage.getItem(walletJournalKey(this.context))
+          if (raw !== null && raw.length <= WALLET_CALL_JOURNAL_BYTES) persistedWalletCallsRaw = raw
+        } catch { /* unsaved details remain exportable when storage cannot be read */ }
+        return JSON.stringify({schema: 2, completeJournal: false,
+          legacy: {schema: 1, records: pending.filter(row => row.source !== 'wallet-calls')},
+          walletCalls: {schema: 1, records: pending.filter(row => row.source === 'wallet-calls')}, persistedWalletCallsRaw}, null, 2)
+      }
       if (pending.length) return JSON.stringify({schema: 1, completeJournal: false, records: pending}, null, 2)
       const raw = this.capabilities.storage.getItem(creditJournalKey(this.context))
+      const walletRaw = this.capabilities.storage.getItem(walletJournalKey(this.context))
+      if (walletRaw !== null && walletRaw.length <= WALLET_CALL_JOURNAL_BYTES && (raw === null || raw.length <= CREDIT_JOURNAL_BYTES))
+        return JSON.stringify({schema: 2, completeJournal: false, legacyRaw: raw, walletCallsRaw: walletRaw}, null, 2)
       if (raw !== null && raw.length <= CREDIT_JOURNAL_BYTES) return raw
       throw new CreditFault('The saved recovery record cannot be exported within its read limit.')
     }

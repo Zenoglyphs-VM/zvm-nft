@@ -16,9 +16,10 @@ async function model() {
   const context = createContext({AbortController, setTimeout, clearTimeout, console})
   const code = stripTypeScriptTypes(readFileSync(new URL('../src/core/credits.ts', import.meta.url), 'utf8'), {mode: 'strip'})
   const program = new SourceTextModule(code, {context})
-  await program.link(name => {throw new Error('Unexpected runtime dependency: ' + name)})
+  const wallet = new SourceTextModule(stripTypeScriptTypes(readFileSync(new URL('../src/core/credit-wallet.ts', import.meta.url), 'utf8'), {mode: 'strip'}), {context})
+  await program.link(name => {if (name === './credit-wallet') return wallet; throw new Error('Unexpected runtime dependency: ' + name)})
   await program.evaluate({timeout: 5000})
-  return program.namespace
+  return {...program.namespace, ...wallet.namespace}
 }
 async function fixture(t, shared = {}) {
   const api = await model(), records = shared.records ?? new Map(), locks = shared.locks ?? new Set()
@@ -290,4 +291,289 @@ test('the recovery record and wallet hash are visible while the receipt wait is 
   assert.equal(f.controller.snapshot().busy, true); assert.equal(f.controller.snapshot().entries[0].record.hash, hash)
   assert.equal(JSON.parse(f.controller.exportRecord()).records[0].hash, hash)
   f.state.receiptGate.resolve(); await sending
+})
+
+// These wallet/provider controls use synthetic capabilities. Actual account,
+// relayer and EVM qualification is recorded separately at its exact UI revision.
+function installWallet(t, f, options = {}) {
+  const s = {sends: 0, statuses: [], discoveries: [], result: null, statusError: options.statusError ?? null,
+    sendError: options.sendError ?? null, capabilityError: options.capabilityError ?? null,
+    capabilities: options.capabilities ?? {['0x' + f.ctx.chainId.toString(16)]: {atomic: {status: 'unsupported'}}},
+    response: null, statusGate: null, onStatus: null, next: 0}
+  const makeReceipt = (h = hash, index = '0x0') => {
+    const r = f.state.receipts.get(h)
+    Object.assign(r, {gasUsed: '0xa180', transactionIndex: index, logs: []})
+    return {transactionHash: h, blockHash: r.blockHash, blockNumber: r.blockNumber, gasUsed: r.gasUsed, status: r.status, logs: []}
+  }
+  const makeResult = (id, status = 200, receipts = []) => ({version: '2.0.0', id,
+    chainId: '0x' + f.ctx.chainId.toString(16), status, atomic: false, receipts})
+  const wallet = {id: () => '0x' + (++s.next).toString(16).padStart(128, '0'), request: async ({method, params}) => {
+    if (method === 'wallet_getCapabilities') {
+      s.discoveries.push(params)
+      if (s.capabilityError) throw s.capabilityError
+      return s.capabilities
+    }
+    if (method === 'wallet_sendCalls') {
+      const request = params[0]
+      s.sends++
+      const durable = saved().at(-1)
+      assert.ok(durable, 'the request is durable before dispatch')
+      assert.equal(JSON.stringify(durable.wallet.request), JSON.stringify(request))
+      assert.equal(durable.hash, null)
+      if (!options.pending) {
+        f.finish('0x1', options.credit ?? 0n)
+        s.result = makeResult(request.id, options.status ?? 200, [makeReceipt()])
+      } else s.result = makeResult(request.id, 100)
+      if (s.sendError) throw s.sendError
+      return s.response ?? {id: request.id}
+    }
+    if (method === 'wallet_getCallsStatus') {
+      s.statuses.push(params)
+      const result = structuredClone(s.result)
+      if (s.statusGate) await s.statusGate.promise
+      if (s.statusError) throw s.statusError
+      if (s.onStatus) return s.onStatus(params, result)
+      return result
+    }
+    throw new Error('Unexpected wallet method: ' + method)
+  }}
+  f.capabilities.wallet = () => wallet
+  const key = f.api.walletJournalKey(f.ctx)
+  const saved = () => JSON.parse(f.records.get(key) ?? '{"schema":1,"records":[]}').records
+  t.after(() => s.statusGate?.resolve())
+  return {...f, w: s, walletKey: key, wallet, walletSaved: saved, makeResult, makeReceipt}
+}
+async function walletFixture(t, options = {}) {return installWallet(t, await fixture(t, options.shared), options)}
+
+test('wallet call id and exact zero-value request are durable before the only dispatch', async t => {
+  const f = await walletFixture(t)
+  assert.equal(f.w.discoveries.length, 0, 'no fingerprinting during account reads')
+  await f.controller.withdraw()
+  const row = f.walletSaved()[0]
+  assert.equal(f.w.sends, 1); assert.equal(f.state.prompts, 0)
+  assert.equal(row.wallet.request.version, '2.0.0'); assert.equal(row.wallet.request.from, owner)
+  assert.equal(row.wallet.request.calls.length, 1); assert.equal(row.wallet.request.calls[0].to, exchange)
+  assert.equal(row.wallet.request.calls[0].data, data); assert.equal(row.wallet.request.calls[0].value, '0x0')
+  assert.equal(row.wallet.request.atomicRequired, false); assert.match(row.wallet.request.id, /^0x[0-9a-f]{128}$/)
+  assert.equal(JSON.stringify(f.w.discoveries), JSON.stringify([[owner, ['0x' + f.ctx.chainId.toString(16)]]]))
+  assert.equal(f.controller.snapshot().entries[0].state, 'executed'); assert.equal(f.controller.snapshot().amount, 0n)
+  assert.equal(row.wallet.results[0].receipts[0].transactionHash, hash)
+})
+test('lost send response recovers the saved id after reload without a second send or signature', async t => {
+  const f = await walletFixture(t, {sendError: new Error('Response lost'), statusError: {code: 5730}})
+  await f.controller.withdraw(); await f.controller.withdraw()
+  const id = f.walletSaved()[0].wallet.request.id
+  assert.equal(f.w.sends, 1); assert.equal(f.state.prompts, 0); assert.equal(f.walletSaved()[0].wallet.results.length, 0)
+  assert.equal(f.controller.snapshot().canWithdraw, false)
+  const reloaded = await fixture(t, {records: f.records, locks: f.locks})
+  reloaded.finish()
+  const g = installWallet(t, reloaded)
+  g.w.result = g.makeResult(id, 200, [g.makeReceipt()])
+  await g.refresh()
+  assert.equal(g.w.sends, 0); assert.equal(g.state.prompts, 0)
+  assert.equal(g.controller.snapshot().entries[0].state, 'executed')
+  assert.ok(g.w.statuses.every(params => params.length === 1 && params[0] === id))
+  assert.equal(g.walletSaved()[0].wallet.request.id, id)
+})
+test('wallet capabilities may fall back only before a send method was dispatched', async t => {
+  const f = await walletFixture(t, {capabilityError: {code: -32601}})
+  await f.controller.withdraw()
+  assert.equal(f.state.prompts, 1); assert.equal(f.w.sends, 0); assert.equal(f.walletSaved().length, 0)
+})
+test('absence of this chain capability uses the legacy path before dispatch', async t => {
+  const f = await walletFixture(t, {capabilities: {'0x1': {atomic: {status: 'supported'}}}})
+  await f.controller.withdraw(); assert.equal(f.state.prompts, 1); assert.equal(f.w.sends, 0)
+})
+test('ambiguous capability failure does not open either sending path', async t => {
+  const f = await walletFixture(t, {capabilityError: new Error('Disconnected')})
+  await f.controller.withdraw()
+  assert.equal(f.state.prompts, 0); assert.equal(f.w.sends, 0); assert.equal(f.walletSaved().length, 0)
+})
+test('storage refusal prevents wallet_sendCalls and preserves the legacy journal', async t => {
+  const f = await walletFixture(t); f.state.failSet = true; await f.controller.withdraw()
+  assert.equal(f.state.prompts, 0); assert.equal(f.w.sends, 0); assert.equal(f.walletSaved().length, 0)
+  assert.equal(f.records.get(f.key), undefined)
+})
+test('a send response with a different id never changes the original recovery id', async t => {
+  const f = await walletFixture(t, {statusError: {code: 5730}})
+  f.w.response = {id: H('f')}; await f.controller.withdraw(); await f.controller.withdraw()
+  const id = f.walletSaved()[0].wallet.request.id
+  assert.notEqual(id, f.w.response.id); assert.equal(f.w.sends, 1); assert.equal(f.state.prompts, 0)
+  assert.ok(f.w.statuses.every(params => params[0] === id)); assert.equal(f.controller.snapshot().canWithdraw, false)
+  f.w.statusError = null; await f.refresh(); assert.equal(f.controller.snapshot().entries[0].state, 'executed')
+})
+for (const [field, value] of [['id', H('f')], ['version', '1.0'], ['chainId', '0x1'], ['atomic', 'true'], ['status', 201]]) {
+  test('malformed wallet ' + field + ' remains unresolved even after a valid earlier receipt', async t => {
+    const f = await walletFixture(t); await f.controller.withdraw()
+    const original = structuredClone(f.w.result)
+    f.w.result[field] = value; f.state.credit = amount; await f.refresh(); await f.controller.withdraw()
+    assert.equal(f.controller.snapshot().entries[0].state, 'unknown'); assert.equal(f.controller.snapshot().canWithdraw, false)
+    assert.equal(f.w.sends, 1); assert.equal(f.state.prompts, 0)
+    assert.equal(f.walletSaved()[0].wallet.results.length, 1)
+    f.w.result = original; await f.refresh(); assert.equal(f.controller.snapshot().entries[0].state, 'executed')
+  })
+}
+test('a wallet-confirmed group stays pending when the actual node receipt is absent', async t => {
+  const f = await walletFixture(t); await f.controller.withdraw(); f.state.receipts.delete(hash); f.state.credit = amount
+  await f.refresh(); await f.controller.withdraw()
+  assert.equal(f.controller.snapshot().entries[0].state, 'pending'); assert.equal(f.w.sends, 1)
+})
+test('canonical removal and restoration reuse the saved id, all hashes and original send', async t => {
+  const f = await walletFixture(t); await f.controller.withdraw()
+  const before = JSON.stringify(f.walletSaved()[0].wallet.request)
+  f.state.blocks.set(6n, H('c')); f.state.hash = H('c'); f.state.credit = amount
+  await f.refresh(); await f.controller.withdraw()
+  assert.equal(f.controller.snapshot().entries[0].state, 'pending'); assert.equal(f.w.sends, 1)
+  f.finish(); f.makeReceipt(); await f.refresh()
+  assert.equal(f.controller.snapshot().entries[0].state, 'executed')
+  assert.equal(JSON.stringify(f.walletSaved()[0].wallet.request), before); assert.equal(f.w.sends, 1)
+})
+test('all receipts in a non-atomic group must match canonical node data', async t => {
+  const f = await walletFixture(t); await f.controller.withdraw()
+  const second = H('4')
+  f.state.receipts.set(second, {...f.state.receipts.get(hash), transactionHash: second, transactionIndex: '0x1'})
+  f.w.result.receipts.push(f.makeReceipt(second, '0x1'))
+  await f.refresh(); assert.equal(f.controller.snapshot().entries[0].state, 'executed')
+  f.state.receipts.delete(second); f.state.credit = amount; await f.refresh(); await f.controller.withdraw()
+  assert.equal(f.controller.snapshot().entries[0].state, 'pending'); assert.equal(f.w.sends, 1)
+  assert.equal(f.walletSaved()[0].wallet.results.at(-1).receipts.length, 2)
+})
+test('a later response cannot silently drop an earlier wallet receipt hash', async t => {
+  const f = await walletFixture(t); await f.controller.withdraw()
+  const first = structuredClone(f.w.result)
+  const second = H('4')
+  f.state.receipts.set(second, {...f.state.receipts.get(hash), transactionHash: second, transactionIndex: '0x1'})
+  f.w.result.receipts.push(f.makeReceipt(second, '0x1')); await f.refresh()
+  f.w.result = first; f.state.credit = amount; await f.refresh(); await f.controller.withdraw()
+  assert.equal(f.controller.snapshot().entries[0].state, 'unknown'); assert.equal(f.w.sends, 1)
+  const history = f.walletSaved()[0].wallet.results
+  assert.ok(history.some(result => result.receipts.some(receipt => receipt.transactionHash === second)))
+})
+test('wallet receipt order is checked against actual block and transaction positions', async t => {
+  const f = await walletFixture(t); await f.controller.withdraw()
+  const second = H('4')
+  f.state.receipts.set(second, {...f.state.receipts.get(hash), transactionHash: second, transactionIndex: '0x1'})
+  f.w.result.receipts.unshift(f.makeReceipt(second, '0x1')); await f.refresh()
+  assert.equal(f.controller.snapshot().entries[0].state, 'unknown'); assert.equal(f.controller.snapshot().canWithdraw, false)
+})
+test('inner wallet failure is distinct from a successful outer bundle receipt', async t => {
+  const f = await walletFixture(t, {status: 500, credit: amount}); await f.controller.withdraw()
+  assert.equal(f.state.receipts.get(hash).status, '0x1')
+  assert.equal(f.controller.snapshot().entries[0].state, 'reverted'); assert.equal(f.controller.snapshot().amount, amount)
+  assert.equal(f.w.sends, 1)
+})
+test('partial wallet failure keeps the whole receipt group under review', async t => {
+  const f = await walletFixture(t, {status: 600, credit: amount}); await f.controller.withdraw(); await f.controller.withdraw()
+  assert.equal(f.controller.snapshot().entries[0].state, 'unknown'); assert.equal(f.w.sends, 1)
+  assert.match(f.controller.snapshot().entries[0].note, /partial failure/i)
+})
+test('an offchain failure is retained as a wallet assertion and is never retried automatically', async t => {
+  const f = await walletFixture(t, {pending: true}); await f.controller.withdraw()
+  f.w.result.status = 400; await f.refresh()
+  assert.equal(f.controller.snapshot().entries[0].state, 'not-submitted'); assert.equal(f.walletSaved().length, 1)
+  assert.equal(f.w.sends, 1); assert.equal(f.controller.snapshot().canWithdraw, true)
+})
+test('a different genesis never queries or retires the original wallet request', async t => {
+  const f = await walletFixture(t, {pending: true}); await f.controller.withdraw()
+  const before = f.w.statuses.length; f.state.genesis = H('f'); await f.refresh()
+  assert.equal(f.w.statuses.length, before); assert.equal(f.controller.snapshot().entries[0].state, 'other-context')
+})
+test('an unresolved legacy request fences wallet capability discovery and new dispatch', async t => {
+  const original = await fixture(t); original.state.mode = 'unknown'; await original.controller.withdraw()
+  const raw = original.records.get(original.key)
+  const f = installWallet(t, original); await f.refresh(); await f.controller.withdraw()
+  assert.equal(f.w.discoveries.length, 0); assert.equal(f.w.sends, 0); assert.equal(f.records.get(f.key), raw)
+})
+test('a terminal legacy record stays byte-for-byte unchanged when the new protocol is used', async t => {
+  const original = await fixture(t); await original.controller.withdraw(); original.state.credit = amount
+  const raw = original.records.get(original.key)
+  const f = installWallet(t, original); await f.refresh(); await f.controller.withdraw()
+  assert.equal(f.w.sends, 1); assert.equal(f.records.get(f.key), raw)
+  assert.equal(f.controller.snapshot().entries.length, 2)
+  const exported = JSON.parse(f.controller.exportRecord())
+  assert.equal(exported.schema, 2); assert.equal(exported.legacy.records.length, 1); assert.equal(exported.walletCalls.records.length, 1)
+})
+test('new wallet receipt details survive storage failure and can be saved without resending', async t => {
+  const f = await walletFixture(t)
+  f.w.onStatus = (_params, result) => {f.state.failSet = true; return result}
+  await f.controller.withdraw()
+  assert.equal(f.controller.snapshot().unsaved, true); assert.equal(f.controller.snapshot().canWithdraw, false)
+  assert.equal(JSON.parse(f.controller.exportRecord()).walletCalls.records[0].wallet.results[0].receipts[0].transactionHash, hash)
+  f.state.failSet = false; f.w.onStatus = null; await f.controller.saveRecovery()
+  assert.equal(f.controller.snapshot().unsaved, false); assert.equal(f.walletSaved()[0].wallet.results[0].receipts[0].transactionHash, hash)
+  assert.equal(f.w.sends, 1)
+})
+test('a newly learned receipt is durable even if its current node proof is malformed', async t => {
+  const f = await walletFixture(t)
+  f.w.onStatus = (_params, result) => {f.state.receipts.get(hash).transactionIndex = null; return result}
+  await f.controller.withdraw()
+  assert.equal(f.walletSaved()[0].wallet.results[0].receipts[0].transactionHash, hash)
+  assert.equal(f.controller.snapshot().amount, null); assert.equal(f.w.sends, 1)
+})
+for (const raw of ['{', '{"schema":2,"records":[]}', ' '.repeat(65537)]) {
+  test('malformed wallet journal is retained and blocks both dispatch paths: ' + raw.slice(0, 24), async t => {
+    const f = await walletFixture(t); f.records.set(f.walletKey, raw); await f.refresh(); await f.controller.withdraw()
+    assert.equal(f.records.get(f.walletKey), raw); assert.equal(f.controller.snapshot().amount, null)
+    assert.equal(f.w.sends, 0); assert.equal(f.state.prompts, 0)
+  })
+}
+test('status expiration cannot clear an unresolved saved id or permit a replacement send', async t => {
+  const f = await walletFixture(t, {pending: true}); await f.controller.withdraw()
+  const raw = f.records.get(f.walletKey); f.w.statusError = {code: 5730}; await f.refresh(); await f.controller.withdraw()
+  assert.equal(f.records.get(f.walletKey), raw); assert.equal(f.controller.snapshot().canWithdraw, false); assert.equal(f.w.sends, 1)
+})
+test('a full bounded wallet observation history is preserved without another status query', async t => {
+  const f = await walletFixture(t, {pending: true}); await f.controller.withdraw()
+  const row = f.walletSaved()[0], result = row.wallet.results[0]
+  row.wallet.results = Array.from({length: f.api.WALLET_CALL_RESULTS}, (_, i) => ({...result, atomic: i % 2 === 0}))
+  const raw = JSON.stringify({schema: 1, records: [row]}); f.records.set(f.walletKey, raw)
+  const before = f.w.statuses.length; await f.refresh(); await f.controller.withdraw()
+  assert.equal(f.records.get(f.walletKey), raw); assert.equal(f.w.statuses.length, before); assert.equal(f.w.sends, 1)
+})
+test('a read timeout never calls the provider again when its late promise resolves', async t => {
+  const api = await model(), gate = deferred(); let calls = 0
+  await assert.rejects(api.boundedWalletRequest({id: () => '', request: () => {calls++; return gate.promise}}, 'wallet_getCallsStatus', ['saved-id'], 2), /timed out/i)
+  gate.resolve({id: 'late-id'}); await new Promise(done => setImmediate(done)); assert.equal(calls, 1)
+})
+test('an account generation change fences a late status response before any journal update', async t => {
+  const f = await walletFixture(t, {pending: true}); await f.controller.withdraw()
+  const raw = f.records.get(f.walletKey); f.w.statusGate = deferred()
+  const before = f.w.statuses.length, reading = f.refresh()
+  while (f.w.statuses.length === before) await new Promise(done => setImmediate(done))
+  f.controller.setContext(null); f.w.statusGate.resolve(); await reading
+  assert.equal(f.records.get(f.walletKey), raw); assert.equal(f.controller.snapshot().amount, null); assert.equal(f.w.sends, 1)
+})
+
+test('wallet recovery details remain a protocol-tagged partial export when storage reads fail', async t => {
+  const f = await walletFixture(t)
+  f.w.onStatus = (_params, result) => {f.state.failSet = true; return result}
+  await f.controller.withdraw(); f.state.failGet = true; await f.refresh()
+  const exported = JSON.parse(f.controller.exportRecord())
+  assert.equal(exported.schema, 2); assert.equal(exported.completeJournal, false)
+  assert.equal(exported.walletCalls.records[0].wallet.results[0].receipts[0].transactionHash, hash)
+  assert.equal(exported.persistedWalletCallsRaw, null); assert.equal(f.w.sends, 1)
+})
+test('divergent saved and unsaved observation histories preserve both versions without overwriting', async t => {
+  const f = await walletFixture(t); await f.controller.withdraw()
+  const second = H('4'), third = H('7')
+  f.state.receipts.set(second, {...f.state.receipts.get(hash), transactionHash: second, transactionIndex: '0x1'})
+  f.w.result.receipts.push(f.makeReceipt(second, '0x1')); f.state.failSet = true; await f.refresh()
+  assert.equal(f.controller.snapshot().unsaved, true)
+  const stored = f.walletSaved()[0]
+  stored.wallet.results.push({...stored.wallet.results[0], receipts: [...stored.wallet.results[0].receipts,
+    {...stored.wallet.results[0].receipts[0], transactionHash: third}]})
+  const raw = JSON.stringify({schema: 1, records: [stored]}); f.records.set(f.walletKey, raw); f.state.failSet = false
+  await f.refresh(); await f.controller.saveRecovery()
+  assert.equal(f.records.get(f.walletKey), raw); assert.equal(f.controller.snapshot().canWithdraw, false)
+  const exported = JSON.parse(f.controller.exportRecord())
+  assert.equal(exported.completeJournal, false); assert.equal(exported.persistedWalletCallsRaw, raw)
+  assert.ok(JSON.stringify(exported.walletCalls).includes(second)); assert.ok(exported.persistedWalletCallsRaw.includes(third))
+  assert.equal(f.w.sends, 1)
+})
+test('two pages cannot dispatch a second wallet request against the same unresolved journal', async t => {
+  const shared = {records: new Map(), locks: new Set()}
+  const first = await walletFixture(t, {shared, pending: true}), second = await walletFixture(t, {shared})
+  await first.controller.withdraw(); await second.controller.withdraw()
+  assert.equal(first.w.sends, 1); assert.equal(second.w.sends, 0); assert.equal(second.state.prompts, 0)
+  assert.equal(second.w.discoveries.length, 0)
 })
