@@ -11,7 +11,6 @@ const QUANTITY = /^0x(?:0|[1-9a-fA-F][0-9a-fA-F]*)$/
 const decimal = (v: unknown) => typeof v === 'string' && /^(0|[1-9][0-9]*)$/.test(v) && v.length <= 78 && BigInt(v) < (1n << 256n)
 const object = (v: unknown): v is Record<string, any> => !!v && typeof v === 'object' && !Array.isArray(v)
 const keys = (v: object, names: string[]) => Object.keys(v).sort().join(',') === names.sort().join(',')
-const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase()
 const hex = (v: bigint) => '0x' + v.toString(16)
 const fault = () => new Error('The wallet recovery response needs review. Keep the original request identifier.')
 
