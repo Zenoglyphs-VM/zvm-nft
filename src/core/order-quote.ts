@@ -102,9 +102,9 @@ export function quoteContextGuard(read: () => OrderQuoteContext, captured = read
   guard()
   return guard
 }
-export function guardedQuoteCalls<T extends {guard?: () => void}>(calls: T[], guard: () => void): T[] {
+export function guardedQuoteCalls<T extends object>(calls: readonly T[], guard: () => void): (T & {guard: () => void})[] {
   return calls.map(call => {
-    const previous = call.guard
+    const previous = (call as {guard?: () => void}).guard
     return {...call, guard: () => {guard(); previous?.()}}
   })
 }
