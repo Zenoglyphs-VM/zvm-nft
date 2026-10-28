@@ -6,13 +6,14 @@
 // price, and one signature over the Merkle root of every order lists them all.
 import {computed, onMounted, ref, watch} from 'vue'
 import {useRoute} from 'vue-router'
-import {parseUnits, type Address} from 'viem'
+import {type Address} from 'viem'
 import {api} from '../core/api'
-import {base} from '../core/endpoint'
+import {base, endpoint} from '../core/endpoint'
+import {listingQuote, quoteContextGuard, guardedQuoteCalls} from '../core/order-quote'
 import {ago, number, units} from '../core/format'
 import {currencyOf, parseMeta} from '../core/nft'
 import {exchangeAddress, sameAddress, useMarket} from '../core/market'
-import {cancelOrdersCall, fetchInput, incrementNonceCall, newOrder, SELL, signOrders, submitOrders} from '../core/orders'
+import {cancelOrdersCall, fetchInput, incrementNonceCall, newOrder, orderDuration, SELL, signOrders, submitOrders} from '../core/orders'
 import {wallet} from '../core/wallet'
 import Panel from '../components/Panel.vue'
 import Badge from '@zvm/web/components/Badge.vue'
@@ -71,31 +72,47 @@ function selectAll() {
 
 /** Lists every selected item at one price, with one signature. */
 async function listSelected() {
-  const ex = exchangeAddress()
-  const owner = market.account()
-  if (!ex || !owner || !bulkPrice.value || !selected.value.size) return
-  const price = parseUnits(bulkPrice.value, 18)
-  const items = unlisted.value.filter((i) => selected.value.has(key(i)))
-  const collections = [...new Map(items.map((i) => [i.collection.toLowerCase(), i])).values()]
-  await market.run(
-    async () => (await Promise.all(collections.map((c) => market.approvalFor(c.collection, owner, ex, c.collectionName || 'a collection')))).flat(),
-    async () => {
-      selected.value = new Set()
-      bulkPrice.value = ''
-      await load()
+  const ex = exchangeAddress(), owner = market.account()
+  if (!ex || !owner || !bulkPrice.value || !selected.value.size || market.busy.value) return
+  const draft = {price: bulkPrice.value, days: bulkDays.value, account: address.value,
+    items: unlisted.value.filter(item => selected.value.has(key(item))).map(item => ({
+      collection: String(item.collection), tokenId: String(item.tokenId), collectionName: String(item.collectionName || 'a collection')}))}
+  if (!draft.items.length) return
+  const selection = () => address.value.toLowerCase() + ':' + [...selected.value].map(value => value.toLowerCase()).sort().join(',')
+  const read = () => ({endpoint: endpoint.url, chainId: wallet.info?.l2.chainId, walletChainId: wallet.evm.chainId,
+    owner: market.account(), signer: wallet.evm.address, provider: wallet.evm.provider, exchange: exchangeAddress(),
+    paymentToken: '0x0000000000000000000000000000000000000000', selection: selection()})
+  const captured = {...read(), owner, exchange: ex,
+    selection: draft.account.toLowerCase() + ':' + draft.items.map(item => key(item).toLowerCase()).sort().join(',')}
+  let prepared: {quote: ReturnType<typeof listingQuote>; guard: () => void} | null = null
+  await market.run(async () => {
+    const quote = listingQuote(draft.price, 'znn')
+    orderDuration(draft.days)
+    const guard = quoteContextGuard(read, captured)
+    prepared = {quote, guard}
+    const collections = [...new Map(draft.items.map(item => [item.collection.toLowerCase(), item])).values()]
+    const calls = (await Promise.all(collections.map(item => market.approvalFor(item.collection as Address, owner, ex, item.collectionName)))).flat()
+    guard()
+    return guardedQuoteCalls(calls, guard)
+  }, async () => {selected.value = new Set(); bulkPrice.value = ''; await load()}, {
+    label: `Sign one listing for ${draft.items.length} item${draft.items.length === 1 ? '' : 's'} at ${draft.price} ZNN each`,
+    fn: async () => {
+      if (!prepared) throw new Error('Review the listings before signing.')
+      const {quote, guard} = prepared
+      const orders = []
+      for (const item of draft.items) {
+        guard()
+        orders.push(await newOrder({side: SELL, collection: item.collection as Address,
+          tokenId: BigInt(item.tokenId), price: quote.amount, paymentToken: quote.paymentToken}, draft.days))
+      }
+      guard()
+      const inputs = await signOrders(orders)
+      guard()
+      await submitOrders(inputs)
+      guard()
+      return `${orders.length} listings, one signature, no transaction`
     },
-    {
-      label: `Sign one listing for ${items.length} item${items.length === 1 ? '' : 's'} at ${bulkPrice.value} ZNN each`,
-      fn: async () => {
-        const orders = []
-        for (const i of items) {
-          orders.push(await newOrder({side: SELL, collection: i.collection as Address, tokenId: BigInt(i.tokenId), price}, bulkDays.value))
-        }
-        await submitOrders(await signOrders(orders))
-        return `${orders.length} listings, one signature, no transaction`
-      },
-    },
-  )
+  })
 }
 
 async function cancelOrder(o: any, label: string) {

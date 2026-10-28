@@ -4,9 +4,10 @@
 // its tokens (D28), and sweeping the floor is one transaction for many listings.
 import {computed, onBeforeUnmount, onMounted, ref, watch} from 'vue'
 import {useRoute} from 'vue-router'
-import {parseUnits, type Address} from 'viem'
+import {type Address} from 'viem'
 import {api} from '../core/api'
 import {wallet} from '../core/wallet'
+import {listingQuote, quotedCount, quoteTotal, quoteContextGuard, guardedQuoteCalls} from '../core/order-quote'
 import {endpoint} from '../core/endpoint'
 import {batchMessage, batchResult, type BatchResult} from '../core/batch-result'
 import {publicClient} from '../core/evm'
@@ -102,29 +103,42 @@ watch(tab, loadTab)
 watch([listedOnly, sort], loadItems)
 
 async function submitOffer() {
-  const bidder = market.account()
-  const wrapped = exchange()?.wrappedZnn
-  if (!bidder || !wrapped || !offerPrice.value) return
-  const price = parseUnits(offerPrice.value, 18)
-  const count = BigInt(offerCount.value)
-  await market.run(
-    () => bidFunding(bidder, price * count),
-    async () => {
-      offering.value = false
-      offerPrice.value = ''
-      offers.value = await api.nftOffers({collection: address.value, collectionOnly: 1, limit: 50})
+  const bidder = market.account(), ex = exchangeAddress(), token = exchange()?.wrappedZnn
+  if (!bidder || !ex || !token || !offerPrice.value || market.busy.value) return
+  const draft = {collection: address.value, price: offerPrice.value, count: offerCount.value, paymentToken: token}
+  const read = () => ({endpoint: endpoint.url, chainId: wallet.info?.l2.chainId, walletChainId: wallet.evm.chainId,
+    owner: market.account(), signer: wallet.evm.address, provider: wallet.evm.provider,
+    exchange: exchangeAddress(), paymentToken: exchange()?.wrappedZnn, selection: offering.value ? address.value.toLowerCase() : ''})
+  const captured = {...read(), owner: bidder, exchange: ex, paymentToken: draft.paymentToken, selection: draft.collection.toLowerCase()}
+  let prepared: {quote: ReturnType<typeof listingQuote>; count: bigint; guard: () => void} | null = null
+  await market.run(async () => {
+    const quote = listingQuote(draft.price, 'znn'), count = quotedCount(draft.count)
+    const total = quoteTotal(quote.amount, count)
+    const guard = quoteContextGuard(read, captured)
+    prepared = {quote, count, guard}
+    const calls = await bidFunding(bidder, total)
+    guard()
+    return guardedQuoteCalls(calls, guard)
+  }, async () => {
+    offering.value = false
+    offerPrice.value = ''
+    const rows = await api.nftOffers({collection: draft.collection, collectionOnly: 1, limit: 50})
+    if (sameAddress(address.value, draft.collection)) offers.value = rows
+  }, {
+    label: `Sign an offer of ${draft.price} ZNN each for ${draft.count} item${draft.count === 1 ? '' : 's'}`,
+    fn: async () => {
+      if (!prepared) throw new Error('Review the collection offer before signing.')
+      const {quote, count, guard} = prepared
+      guard()
+      const order = await newOrder({side: BUY, collection: draft.collection as Address, tokenId: 0n,
+        anyToken: true, amount: count, price: quote.amount, paymentToken: draft.paymentToken}, 30)
+      guard()
+      const input = await signOrder(order)
+      guard()
+      await submitOrders([input])
+      guard()
     },
-    {
-      label: `Sign an offer of ${offerPrice.value} ZNN each for ${offerCount.value} item${offerCount.value === 1 ? '' : 's'}`,
-      fn: async () => {
-        const order = await newOrder(
-          {side: BUY, collection: address.value as Address, tokenId: 0n, anyToken: true, amount: count, price, paymentToken: wrapped},
-          30,
-        )
-        await submitOrders([await signOrder(order)])
-      },
-    },
-  )
+  })
 }
 
 /** Buys the cheapest listings in one transaction, skipping any sold a moment earlier. */
