@@ -577,3 +577,107 @@ test('two pages cannot dispatch a second wallet request against the same unresol
   assert.equal(first.w.sends, 1); assert.equal(second.w.sends, 0); assert.equal(second.state.prompts, 0)
   assert.equal(second.w.discoveries.length, 0)
 })
+
+test('direct user rejection stays terminal when the wallet never retained a batch status', async t => {
+  const f = await walletFixture(t, {pending: true, sendError: Object.assign(new Error('User rejected'), {code: 4001}), statusError: {code: 5730}})
+  await f.controller.withdraw()
+  assert.equal(f.w.sends, 1); assert.equal(f.state.prompts, 0)
+  assert.equal(f.controller.snapshot().entries[0].state, 'not-submitted')
+  assert.equal(f.controller.snapshot().canWithdraw, true)
+  assert.equal(f.walletSaved().length, 1)
+})
+
+test('a rejected request survives reload without batch status and a new request needs another user action', async t => {
+  const f = await walletFixture(t, {pending: true, sendError: Object.assign(new Error('Rejected'), {code: 4001}), statusError: {code: 5730}})
+  await f.controller.withdraw(); const raw = f.records.get(f.walletKey), id = f.walletSaved()[0].wallet.request.id
+  const g = installWallet(t, await fixture(t, {records: f.records, locks: f.locks}), {pending: true, statusError: {code: 5730}})
+  g.state.id = 1; g.w.next = 1; await g.refresh(); await g.refresh()
+  assert.equal(g.controller.snapshot().entries[0].state, 'not-submitted'); assert.equal(g.controller.snapshot().canWithdraw, true)
+  assert.equal(g.w.sends, 0); assert.equal(g.records.get(g.walletKey), raw)
+  await g.controller.withdraw()
+  assert.equal(g.w.sends, 1); assert.equal(g.walletSaved().length, 2)
+  assert.equal(g.walletSaved()[0].wallet.request.id, id); assert.notEqual(g.walletSaved()[1].wallet.request.id, id)
+  assert.equal(JSON.stringify(g.walletSaved()[0]), JSON.stringify(f.walletSaved()[0]))
+})
+for (const error of [{cause: {code: 4001}}, {code: '4001'}, {code: 4900}, {message: 'User rejected request'}, 4001]) {
+  test('ambiguous or nested rejection stays unresolved: ' + JSON.stringify(error), async t => {
+    const f = await walletFixture(t, {pending: true, sendError: error, statusError: {code: 5730}})
+    await f.controller.withdraw(); await f.controller.withdraw()
+    assert.equal(f.w.sends, 1); assert.equal(f.controller.snapshot().entries[0].state, 'unknown')
+    assert.equal(f.controller.snapshot().canWithdraw, false)
+    assert.equal(f.walletSaved()[0].wallet.dispatchRejection, undefined)
+  })
+}
+test('a status-query rejection cannot become a send-request rejection', async t => {
+  const f = await walletFixture(t, {pending: true, statusError: {code: 4001}})
+  await f.controller.withdraw(); await f.controller.withdraw()
+  assert.equal(f.walletSaved()[0].wallet.dispatchRejection, undefined)
+  assert.equal(f.controller.snapshot().entries[0].state, 'unknown'); assert.equal(f.w.sends, 1)
+})
+test('a receipt contradicting a direct rejection retains both facts and blocks another send', async t => {
+  const f = await walletFixture(t, {credit: amount, sendError: Object.assign(new Error('Rejected'), {code: 4001})})
+  await f.controller.withdraw(); await f.controller.withdraw()
+  const row = f.walletSaved()[0]
+  assert.equal(row.wallet.dispatchRejection.code, 4001); assert.equal(row.wallet.results[0].status, 200)
+  assert.equal(row.wallet.results[0].receipts[0].transactionHash, hash)
+  assert.equal(f.controller.snapshot().entries[0].state, 'unknown'); assert.equal(f.controller.snapshot().canWithdraw, false); assert.equal(f.w.sends, 1)
+})
+test('pending status contradicting rejection cannot silently retire the saved request', async t => {
+  const f = await walletFixture(t, {pending: true, sendError: Object.assign(new Error('Rejected'), {code: 4001})})
+  await f.controller.withdraw(); await f.controller.withdraw()
+  assert.equal(f.walletSaved()[0].wallet.dispatchRejection.code, 4001)
+  assert.equal(f.walletSaved()[0].wallet.results[0].status, 100)
+  assert.equal(f.controller.snapshot().entries[0].state, 'unknown'); assert.equal(f.w.sends, 1)
+})
+test('the direct rejection annotation survives a later offchain wallet status', async t => {
+  const f = await walletFixture(t, {pending: true, sendError: Object.assign(new Error('Rejected'), {code: 4001}), statusError: {code: 5730}})
+  await f.controller.withdraw(); f.w.statusError = null; f.w.result.status = 400; await f.refresh()
+  const row = f.walletSaved()[0]
+  assert.equal(row.wallet.dispatchRejection.code, 4001); assert.equal(row.wallet.results[0].status, 400)
+  assert.equal(f.controller.snapshot().entries[0].state, 'not-submitted'); assert.equal(f.w.sends, 1)
+})
+test('rejection persistence failure keeps the exact original id and annotation exportable', async t => {
+  const f = await walletFixture(t, {pending: true, statusError: {code: 5730}})
+  f.wallet.request = async ({method, params}) => {
+    if (method === 'wallet_getCapabilities') return f.w.capabilities
+    if (method === 'wallet_getCallsStatus') throw {code: 5730}
+    assert.equal(method, 'wallet_sendCalls'); assert.equal(params[0].id, f.walletSaved()[0].wallet.request.id)
+    f.w.sends++; f.state.failSet = true; throw Object.assign(new Error('Rejected'), {code: 4001})
+  }
+  await f.controller.withdraw(); const id = f.walletSaved()[0].wallet.request.id
+  assert.equal(f.walletSaved()[0].wallet.dispatchRejection, undefined)
+  assert.equal(f.controller.snapshot().unsaved, true); assert.equal(f.controller.snapshot().canWithdraw, false)
+  const exported = JSON.parse(f.controller.exportRecord())
+  assert.equal(exported.walletCalls.records[0].wallet.request.id, id)
+  assert.equal(exported.walletCalls.records[0].wallet.dispatchRejection.code, 4001)
+  f.state.failSet = false; await f.controller.saveRecovery()
+  assert.equal(f.walletSaved()[0].wallet.dispatchRejection.code, 4001)
+  assert.equal(f.controller.snapshot().unsaved, false); assert.equal(f.controller.snapshot().canWithdraw, true); assert.equal(f.w.sends, 1)
+})
+test('a late rejection is saved only under its original owner after context change', async t => {
+  const f = await walletFixture(t, {pending: true, statusError: {code: 5730}}), gate = deferred();let entered = false
+  f.wallet.request = async ({method}) => {
+    if (method === 'wallet_getCapabilities') return f.w.capabilities
+    if (method === 'wallet_getCallsStatus') throw {code: 5730}
+    assert.equal(method, 'wallet_sendCalls'); f.w.sends++; entered = true; await gate.promise; throw {code: 4001}
+  }
+  t.after(() => gate.resolve())
+  const operation = f.controller.withdraw()
+  while (!entered) await new Promise(done => setImmediate(done))
+  f.controller.setContext(null); gate.resolve(); await operation
+  assert.equal(f.walletSaved()[0].owner, owner); assert.equal(f.walletSaved()[0].wallet.dispatchRejection.code, 4001)
+  assert.equal(f.controller.snapshot().amount, null); assert.equal(f.controller.snapshot().canWithdraw, false)
+})
+test('old wallet journal bytes remain unchanged while being read without rejection metadata', async t => {
+  const f = await walletFixture(t, {pending: true}); await f.controller.withdraw()
+  const raw = f.records.get(f.walletKey); await f.refresh(); await f.refresh()
+  assert.equal(f.records.get(f.walletKey), raw); assert.equal(f.walletSaved()[0].wallet.dispatchRejection, undefined)
+})
+for (const rejection of [null, {method: 'eth_sendTransaction', code: 4001}, {method: 'wallet_sendCalls', code: '4001'}, {method: 'wallet_sendCalls', code: 4001, extra: true}]) {
+  test('invalid dispatch annotation is retained and refused: ' + JSON.stringify(rejection), async t => {
+    const f = await walletFixture(t, {pending: true}); await f.controller.withdraw()
+    const row = f.walletSaved()[0]; row.wallet.dispatchRejection = rejection
+    const raw = JSON.stringify({schema: 1, records: [row]}); f.records.set(f.walletKey, raw); await f.refresh(); await f.controller.withdraw()
+    assert.equal(f.records.get(f.walletKey), raw); assert.equal(f.controller.snapshot().amount, null); assert.equal(f.w.sends, 1)
+  })
+}

@@ -41,11 +41,28 @@ export interface WalletResult {
 }
 export interface WalletWithdrawalRecord extends Omit<LegacyWithdrawalRecord, 'source'> {
   source: 'wallet-calls'
-  wallet: {request: WalletRequest; results: WalletResult[]}
+  wallet: {request: WalletRequest; results: WalletResult[]; dispatchRejection?: {method: 'wallet_sendCalls'; code: 4001}}
 }
 export interface CreditWallet {
   request: (args: {method: string; params: unknown[]}) => Promise<unknown>
   id: () => string
+}
+
+export function directWalletRejection(error: unknown): boolean {
+  // Only the direct response to wallet_sendCalls has this meaning. A nested
+  // error or a later status-query failure cannot prove rejection of a send.
+  return object(error) && error.code === 4001
+}
+
+export function mergeWalletEvidence(saved: WalletWithdrawalRecord, pending: WalletWithdrawalRecord): WalletWithdrawalRecord {
+  const stable = (row: WalletWithdrawalRecord) => JSON.stringify({...row, wallet: {request: row.wallet.request, results: []}})
+  const a = saved.wallet.results, b = pending.wallet.results
+  if (stable(saved) !== stable(pending) || a.slice(0, Math.min(a.length, b.length))
+    .some((result, index) => JSON.stringify(result) !== JSON.stringify(b[index])))
+    throw new Error('Wallet request or observation histories diverged. Keep both versions for review.')
+  const dispatchRejection = saved.wallet.dispatchRejection ?? pending.wallet.dispatchRejection
+  return {...saved, wallet: {request: saved.wallet.request, results: a.length > b.length ? a : b,
+    ...(dispatchRejection ? {dispatchRejection} : {})}}
 }
 
 export function walletJournalKey(context: Pick<CreditContext, 'chainId' | 'exchange' | 'owner'>): string {
@@ -127,7 +144,7 @@ export function appendWalletResult(record: WalletWithdrawalRecord, result: Walle
   const results = record.wallet.results
   if (results.length && JSON.stringify(results[results.length - 1]) === JSON.stringify(result)) return record
   if (results.length >= WALLET_CALL_RESULTS) throw new Error('Wallet recovery history is full. Download the record before further review.')
-  return {...record, wallet: {request: record.wallet.request, results: [...results, result]}}
+  return {...record, wallet: {...record.wallet, results: [...results, result]}}
 }
 export function walletResultComplete(record: WalletWithdrawalRecord): boolean {
   const results = record.wallet.results, latest = results[results.length - 1]
@@ -149,15 +166,21 @@ export function readWalletJournal(raw: string | null, context: CreditContext, da
       row.owner !== context.owner.toLowerCase() || row.exchange !== context.exchange.toLowerCase() || row.data !== data || row.value !== '0' ||
       row.hash !== null || row.source !== 'wallet-calls' || !decimal(row.head) || !decimal(row.nonce) ||
       ['genesis','headHash','endpointHash'].some(k => typeof row[k] !== 'string' || !HASH.test(row[k])) ||
-      !object(row.wallet) || !keys(row.wallet, ['request','results']) || !object(row.wallet.request)) throw fault()
+      !object(row.wallet) || !(keys(row.wallet, ['request','results']) || keys(row.wallet, ['request','results','dispatchRejection'])) || !object(row.wallet.request)) throw fault()
     const request = walletRequest(context, data, row.wallet.request.id)
     if (!keys(row.wallet.request, ['version','id','from','chainId','atomicRequired','calls']) ||
       JSON.stringify(row.wallet.request) !== JSON.stringify(request) || calls.has(request.id) ||
       !Array.isArray(row.wallet.results) || row.wallet.results.length > WALLET_CALL_RESULTS) throw fault()
     const results = row.wallet.results.map((r: unknown) => parseWalletResult(r, request, context.chainId))
     if (JSON.stringify(results) !== JSON.stringify(row.wallet.results)) throw fault()
+    const wallet: WalletWithdrawalRecord['wallet'] = {request, results}
+    if (Object.prototype.hasOwnProperty.call(row.wallet, 'dispatchRejection')) {
+      const rejection = row.wallet.dispatchRejection
+      if (!object(rejection) || !keys(rejection, ['method','code']) || rejection.method !== 'wallet_sendCalls' || rejection.code !== 4001) throw fault()
+      wallet.dispatchRejection = {method: 'wallet_sendCalls', code: 4001}
+    }
     ids.add(row.id); calls.add(request.id)
-    return {...row, wallet: {request, results}} as WalletWithdrawalRecord
+    return {...row, wallet} as WalletWithdrawalRecord
   })
 }
 export function sameWalletLog(value: unknown, expected: WalletLog): boolean {

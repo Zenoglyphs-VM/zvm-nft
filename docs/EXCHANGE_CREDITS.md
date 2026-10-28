@@ -107,7 +107,7 @@ preparation anchor and original nonce before calling the provider. Its separate
 bounded journal leaves schema-1 withdrawal bytes unchanged. Both journals share
 one exclusion lock and a combined 32-record limit. Any unresolved older record
 blocks either sending protocol. Unsupported discovery can select the legacy
-method before dispatch. After dispatch there is no fallback, resubmission, new id
+method before dispatch. While dispatch remains unresolved there is no fallback, resubmission, new id
 or replacement signature, including after a lost response or a timeout.
 
 Recovery queries only `wallet_getCallsStatus` for the saved id. The exact id,
@@ -143,3 +143,33 @@ these model controls or a successful frontend build.
 
 If saved and unsaved wallet observations diverge between pages, neither version
 is overwritten. A partial recovery export retains both versions for review.
+
+
+## Explicit cancellation without a stored batch status
+
+A direct numeric `4001` rejection of the original `wallet_sendCalls` request is
+recorded on that exact request as `dispatchRejection`, with the method and code.
+The bounded annotation contains no raw provider error, message, stack or account
+metadata. The original id, payload, preparation anchor and every observation stay
+in the journal. A wallet may reject before retaining any queryable batch status;
+that unavailable status does not erase a durably saved direct rejection.
+
+A retained direct rejection with no conflicting status is displayed as the
+wallet's assertion that the request was not submitted. A later pending, completed,
+partial or receipted status conflicts with that assertion and blocks a new request.
+Nested causes, string codes, message matching, transport loss and a rejection of a
+later status query cannot create a dispatch-rejection annotation. Unknown status
+without the original direct rejection remains unresolved.
+
+This interpretation follows the Wallet Call API requirement that a wallet must
+not send calls when the user rejects the request. It is a provider assertion,
+not independent proof about chain execution. Refresh and reload never dispatch
+again. Another withdrawal requires a new explicit user action, a fresh canonical
+credit read and a distinct request id; the rejected original stays unchanged.
+Persistence failure retains the annotation in the recovery export and blocks
+another request until the original record is safely saved. A late rejection can
+be saved only under its original owner and chain key after a context change;
+it cannot publish a stale balance into the newly selected context.
+
+Existing wallet-journal rows without this optional annotation remain readable
+without rewriting their bytes. The legacy transaction journal is unchanged.

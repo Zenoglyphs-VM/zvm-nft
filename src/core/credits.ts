@@ -1,6 +1,7 @@
 import type {CreditRead, CreditRpc} from './credit-rpc'
 import {walletJournalKey, readWalletJournal, walletRequest, supportsWalletCalls, walletMethodUnsupported,
   boundedWalletRequest, parseWalletResult, appendWalletResult, walletResultComplete, walletQuantity, sameWalletLog,
+  directWalletRejection, mergeWalletEvidence,
   WALLET_CALL_JOURNAL_BYTES, WALLET_CALL_RESULTS, type CreditWallet, type WalletWithdrawalRecord} from './credit-wallet'
 
 export const CREDIT_HISTORY_LIMIT = 32
@@ -193,11 +194,9 @@ export class CreditController {
         if (row.source !== 'wallet-calls' || pending.source !== 'wallet-calls' ||
           JSON.stringify(row.wallet.request) !== JSON.stringify(pending.wallet.request))
           throw new CreditFault('The original wallet call request changed. Keep its saved identifier.')
-        const stable = (value: WalletWithdrawalRecord) => JSON.stringify({...value, wallet: {...value.wallet, results: []}})
-        if (stable(row) !== stable(pending) || row.wallet.results.slice(0, Math.min(row.wallet.results.length, pending.wallet.results.length))
-          .some((result, index) => JSON.stringify(result) !== JSON.stringify(pending.wallet.results[index])))
-          throw new CreditFault('Saved and unsaved wallet observations diverged. Download both versions for review.')
-        if (row.wallet.results.length > pending.wallet.results.length) continue
+        try {Object.assign(row, mergeWalletEvidence(row, pending))}
+        catch {throw new CreditFault('Saved and unsaved wallet observations diverged. Download both versions for review.')}
+        continue
       }
       Object.assign(row, copyRecord(pending))
     }
@@ -248,11 +247,34 @@ export class CreditController {
     this.emit()
     // The complete caller-generated id and exact request are durable before the
     // provider sees a send. Any response loss is resolved only by this same id.
-    const response: any = await boundedWalletRequest(wallet, 'wallet_sendCalls', [JSON.parse(JSON.stringify(record.wallet.request))], 60000)
+    let response: any
+    try {response = await boundedWalletRequest(wallet, 'wallet_sendCalls', [JSON.parse(JSON.stringify(record.wallet.request))], 60000)}
+    catch (error) {
+      if (directWalletRejection(error)) {
+        try {this.saveDispatchRejection(context, record)}
+        catch {throw new CreditFault('The wallet reported rejection, but its recovery details could not be saved. Download the record before leaving.')}
+        throw new CreditFault('The wallet rejected this request. Its saved record is retained; no automatic retry was made.')
+      }
+      throw error
+    }
     this.guard(context, generation)
     if (!response || typeof response !== 'object' || Array.isArray(response) || response.id !== record.wallet.request.id)
       throw new CreditFault('The wallet response did not identify the saved request. Review its status without sending again.')
     this.value.note = 'The wallet accepted this request identifier. Its status and canonical receipts are checked without sending it again.'
+  }
+  private saveDispatchRejection(context: CreditContext, original: WalletWithdrawalRecord) {
+    const rejected: WalletWithdrawalRecord = {...original, wallet: {...original.wallet, dispatchRejection: {method: 'wallet_sendCalls', code: 4001}}}
+    this.unsaved.set(original.id, copyRecord(rejected))
+    // Retain the original request's response even after an account generation
+    // changes. The immutable payload and journal key remain bound to its owner.
+    const raw = this.capabilities.storage.getItem(walletJournalKey(context))
+    const rows = readWalletJournal(raw, context, this.capabilities.withdrawData)
+    const own = rows.find(row => row.id === original.id)
+    if (!own) throw new CreditFault('The original wallet recovery record changed after rejection.')
+    Object.assign(own, mergeWalletEvidence(own, rejected))
+    this.unsaved.set(original.id, copyRecord(own))
+    this.writeWallet(context, rows, raw)
+    this.unsaved.delete(original.id)
   }
   private async inspectWallet(context: CreditContext, generation: number, original: WalletWithdrawalRecord, genesis: string, head: Block, read: CreditRead): Promise<CreditEntry> {
     if (!equal(original.genesis, genesis)) return {record: original, state: 'other-context'}
@@ -268,10 +290,10 @@ export class CreditController {
         received = true
       } catch {
         this.guard(context, generation)
-        // Only retained, already associated receipts may remain useful after a
-        // wallet forgets an id. An unknown id never authorizes another send.
+        // Retained associated receipts or a direct dispatch rejection remain
+        // evidence when a wallet forgets an id. An unknown id alone is unresolved.
         note = 'Current wallet status is unavailable. Retained receipts are checked; keep this original request identifier.'
-        if (!this.capabilities.canSend(context) || !record.wallet.results.length) return {record, state: 'unknown', note}
+        if ((!this.capabilities.canSend(context) || !record.wallet.results.length) && !record.wallet.dispatchRejection) return {record, state: 'unknown', note}
       }
       if (received) {
         try {
@@ -284,6 +306,11 @@ export class CreditController {
     }
     if (read.signal.aborted) throw new CreditFault('The credit read timed out. Retain the wallet recovery details.')
     const latest = record.wallet.results[record.wallet.results.length - 1]
+    if (record.wallet.dispatchRejection) {
+      if (record.wallet.results.some(result => result.status !== 400 || result.receipts.length))
+        return {record, state: 'unknown', note: 'Wallet status conflicts with its original rejection. Keep the request and every receipt for review.'}
+      return {record, state: 'not-submitted', note: 'The wallet reported user rejection of this send request. Its original record is retained; another request requires your action.'}
+    }
     if (!latest || !walletResultComplete(record)) return {record, state: 'unknown', note: note || 'The complete wallet receipt group is unresolved.'}
     if (latest.status === 400) return {record, state: 'not-submitted', note: 'The wallet reports that this request was not included and will not be retried.'}
     let previous: {number: bigint; index: bigint} | null = null

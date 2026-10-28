@@ -83,6 +83,13 @@ const stateWord = {unknown: 'Original wallet request needs review', pending: 'Ca
   executed: 'Wallet transaction confirmed; credit was read again', reverted: 'Transaction reverted; credit was read again',
   'not-submitted': 'Wallet reports this request was not sent and will not be retried',
   'other-context': 'Reconnect the original chain context before resolving this withdrawal'}
+function stateLabel(entry: CreditEntry): string {
+  if (entry.record.source === 'wallet-calls') {
+    if (entry.state === 'executed') return 'Wallet reports completion; canonical receipts checked; credit was read again'
+    if (entry.state === 'reverted') return 'Wallet reports call failure; canonical receipts checked; credit was read again'
+  }
+  return stateWord[entry.state]
+}
 function storageChanged(event: StorageEvent) {
   if (selected && (event.key === null || event.key === creditJournalKey(selected.context) || event.key === walletJournalKey(selected.context))) void controller.refresh()
 }
@@ -137,7 +144,7 @@ onUnmounted(() => {clearInterval(timer); window.removeEventListener('storage', s
     <p v-if="view.unsaved" role="status" class="text-[13px] text-[var(--color-danger)]">Recovery details have not been saved. Download the recovery record before leaving; another withdrawal is stopped.</p>
     <p v-if="downloadError" role="status" class="text-[13px] text-[var(--color-danger)]">{{ downloadError }}</p>
     <div v-for="entry in view.entries" :key="entry.record.id" class="grid gap-1 text-[12px]" data-testid="credit-withdrawal" :data-state="entry.state">
-      <p>{{ stateWord[entry.state] }}</p>
+      <p>{{ stateLabel(entry) }}</p>
       <p v-if="entry.note">{{ entry.note }}</p>
       <template v-if="entry.record.source === 'wallet-calls'">
         <p>Original wallet request identifier</p>
