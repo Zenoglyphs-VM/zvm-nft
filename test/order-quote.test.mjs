@@ -31,7 +31,7 @@ async function quoteModule() {
 }
 async function listingFixture(surface = 'list') {
   const calls = {approvals: [], funding: [], orders: [], signs: [], posts: [], errors: []}
-  const price = {value: '1.25'}, currency = {value: 'qsr'}, days = {value: 30}
+  const price = {value: '1.25'}, currency = {value: surface === 'bulk' ? 'znn' : 'qsr'}, days = {value: 30}
   const info = {l2: {chainId: 7340470}, apps: {exchange: exchangeAddressValue, rewardToken: null, wrappedZnn: address(4)}}
   const provider = {}, wallet = {info, address: owner, chainId: 7340470, provider,
     evm: {address: owner, chainId: 7340470, provider}}
@@ -65,7 +65,7 @@ async function listingFixture(surface = 'list') {
     name: {value: 'Fixture'}, symbol: {get value() {return currency.value.toUpperCase()}},
     collection, tokenId, collectionInfo: {value: {name: 'Fixture'}},
     collections: {get value() {return props.items}}, panel, offering, address: pageAddress,
-    bulkPrice: price, bulkDays: days, offerPrice: price, offerCount: quantity, quantity, selected,
+    bulkPrice: price, bulkCurrency: currency, bulkDays: days, offerPrice: price, offerCount: quantity, quantity, selected,
     unlisted: {get value() {return props.items}}, key: item => item.collection + ':' + item.tokenId,
     wrapped: {get value() {return info.apps.wrappedZnn}},
     market, approvalFor, exchangeAddress: () => info.apps.exchange,
@@ -278,6 +278,39 @@ if (nft) {
     await f.list(); assert.deepEqual(f.calls.errors, []); assert.equal(f.calls.orders.length, 2); assert.equal(f.calls.posts.length, 1)
     for (const order of f.calls.orders) {assert.equal(order.price, 1250000000000000000n); assert.equal(order.duration, 30)}
     assert.equal(f.calls.orders[0].tokenId, 7n); assert.equal(f.calls.orders[1].tokenId, 8n)
+  })
+  test('bulk QSR preserves both exact eight-decimal quotes when the form changes during approval', async () => {
+    const f = await listingFixture('bulk'); f.currency.value = 'qsr'; f.info.apps.rewardToken = address(4)
+    f.price.value = '0.20000001'
+    f.props.items.push({...f.props.items[0], tokenId: '8'}); f.selected.value.add(collectionAddress + ':8')
+    f.hooks.approval = () => {f.price.value = '99'; f.currency.value = 'znn'; f.days.value = 1}
+    await f.list(); assert.deepEqual(f.calls.errors, []); assert.equal(f.calls.orders.length, 2); assert.equal(f.calls.posts.length, 1)
+    for (const order of f.calls.orders) {
+      assert.equal(order.price, 20000001n); assert.equal(order.paymentToken, address(4)); assert.equal(order.duration, 30)
+    }
+  })
+  for (const stage of ['approval', 'nonce']) {
+    test('bulk QSR refuses a changed reward-token mapping during ' + stage, async () => {
+      const f = await listingFixture('bulk'); f.currency.value = 'qsr'; f.info.apps.rewardToken = address(4)
+      f.hooks[stage] = () => {f.info.apps.rewardToken = address(5)}
+      await f.list(); assert.equal(f.calls.signs.length, 0); assert.equal(f.calls.posts.length, 0)
+      assert.match(f.calls.errors[0], /changed|review/i)
+    })
+  }
+  test('bulk QSR cannot publish a signature after its reward-token mapping changes', async () => {
+    const f = await listingFixture('bulk'); f.currency.value = 'qsr'; f.info.apps.rewardToken = address(4)
+    f.hooks.sign = () => {f.info.apps.rewardToken = address(5)}
+    await f.list(); assert.equal(f.calls.signs.length, 1); assert.equal(f.calls.posts.length, 0)
+  })
+  for (const token of [null, zero, 'not-an-address']) {
+    test('bulk QSR refuses missing or invalid configuration before approval: ' + String(token), async () => {
+      const f = await listingFixture('bulk'); f.currency.value = 'qsr'; f.info.apps.rewardToken = token
+      await f.list(); assert.equal(f.calls.approvals.length, 0); assert.equal(f.calls.signs.length, 0); assert.equal(f.calls.posts.length, 0)
+    })
+  }
+  test('bulk QSR refuses a price below its supported base unit before approval', async () => {
+    const f = await listingFixture('bulk'); f.currency.value = 'qsr'; f.info.apps.rewardToken = address(4); f.price.value = '0.000000001'
+    await f.list(); assert.equal(f.calls.approvals.length, 0); assert.equal(f.calls.signs.length, 0); assert.equal(f.calls.posts.length, 0)
   })
   test('changing the bulk selection cannot create a partial signature over a different set', async () => {
     const f = await listingFixture('bulk'); f.hooks.approval = () => f.selected.value.clear()

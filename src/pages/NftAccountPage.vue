@@ -35,6 +35,7 @@ const error = ref<string | null>(null)
 const tab = ref<'owned' | 'created' | 'listings' | 'offers' | 'activity'>('owned')
 const selected = ref<Set<string>>(new Set())
 const bulkPrice = ref('')
+const bulkCurrency = ref<'znn' | 'qsr'>('znn')
 const bulkDays = ref(30)
 
 const market = useMarket()
@@ -74,19 +75,21 @@ function selectAll() {
 async function listSelected() {
   const ex = exchangeAddress(), owner = market.account()
   if (!ex || !owner || !bulkPrice.value || !selected.value.size || market.busy.value) return
-  const draft = {price: bulkPrice.value, days: bulkDays.value, account: address.value,
+  const draft = {price: bulkPrice.value, currency: bulkCurrency.value, rewardToken: qsr.value,
+    days: bulkDays.value, account: address.value,
     items: unlisted.value.filter(item => selected.value.has(key(item))).map(item => ({
       collection: String(item.collection), tokenId: String(item.tokenId), collectionName: String(item.collectionName || 'a collection')}))}
   if (!draft.items.length) return
   const selection = () => address.value.toLowerCase() + ':' + [...selected.value].map(value => value.toLowerCase()).sort().join(',')
   const read = () => ({endpoint: endpoint.url, chainId: wallet.info?.l2.chainId, walletChainId: wallet.evm.chainId,
     owner: market.account(), signer: wallet.evm.address, provider: wallet.evm.provider, exchange: exchangeAddress(),
-    paymentToken: '0x0000000000000000000000000000000000000000', selection: selection()})
+    paymentToken: draft.currency === 'qsr' ? qsr.value : '0x0000000000000000000000000000000000000000', selection: selection()})
   const captured = {...read(), owner, exchange: ex,
+    paymentToken: draft.currency === 'qsr' ? draft.rewardToken : '0x0000000000000000000000000000000000000000',
     selection: draft.account.toLowerCase() + ':' + draft.items.map(item => key(item).toLowerCase()).sort().join(',')}
   let prepared: {quote: ReturnType<typeof listingQuote>; guard: () => void} | null = null
   await market.run(async () => {
-    const quote = listingQuote(draft.price, 'znn')
+    const quote = listingQuote(draft.price, draft.currency, draft.rewardToken)
     orderDuration(draft.days)
     const guard = quoteContextGuard(read, captured)
     prepared = {quote, guard}
@@ -95,7 +98,7 @@ async function listSelected() {
     guard()
     return guardedQuoteCalls(calls, guard)
   }, async () => {selected.value = new Set(); bulkPrice.value = ''; await load()}, {
-    label: `Sign one listing for ${draft.items.length} item${draft.items.length === 1 ? '' : 's'} at ${draft.price} ZNN each`,
+    label: `Sign one listing for ${draft.items.length} item${draft.items.length === 1 ? '' : 's'} at ${draft.price} ${draft.currency.toUpperCase()} each`,
     fn: async () => {
       if (!prepared) throw new Error('Review the listings before signing.')
       const {quote, guard} = prepared
@@ -181,8 +184,15 @@ const tabs = [
           <div v-if="isMine && unlisted.length" class="px-4 pt-4 flex flex-wrap items-end gap-2">
             <button class="btn" @click="selectAll">{{ selected.size === unlisted.length ? 'Clear' : `Select all ${unlisted.length} unlisted` }}</button>
             <label class="grid gap-1">
-              <span class="ledger">Price each, ZNN</span>
+              <span class="ledger">Price each, {{ bulkCurrency.toUpperCase() }}</span>
               <input v-model="bulkPrice" inputmode="decimal" placeholder="0" aria-label="Price each" class="input w-[120px]" />
+            </label>
+            <label class="grid gap-1">
+              <span class="ledger">Currency</span>
+              <select v-model="bulkCurrency" aria-label="Bulk listing currency" class="input">
+                <option value="znn">ZNN</option>
+                <option v-if="qsr" value="qsr">QSR</option>
+              </select>
             </label>
             <label class="grid gap-1">
               <span class="ledger">Days</span>
