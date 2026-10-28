@@ -47,7 +47,7 @@ const tooltip = computed(() => {
 
 <template>
   <span v-if="address" class="inline-flex items-center gap-1 min-w-0 align-baseline">
-    <router-link :to="`/address/${address}`" class="mono text-[13px] link" :style="brand ? {color: brand} : undefined" :title="tooltip">
+    <router-link :to="`/account/${address}`" class="mono text-[13px] link" :style="brand ? {color: brand} : undefined" :title="tooltip">
       {{ display }}
     </router-link>
     <VerifiedMark :address="address" />

@@ -6,12 +6,14 @@
 // price, and one signature over the Merkle root of every order lists them all.
 import {computed, onMounted, ref, watch} from 'vue'
 import {useRoute} from 'vue-router'
-import {parseUnits, type Address} from 'viem'
+import {type Address} from 'viem'
 import {api} from '../core/api'
+import {base, endpoint} from '../core/endpoint'
+import {listingQuote, quoteContextGuard, guardedQuoteCalls} from '../core/order-quote'
 import {ago, number, units} from '../core/format'
 import {currencyOf, parseMeta} from '../core/nft'
 import {exchangeAddress, sameAddress, useMarket} from '../core/market'
-import {cancelOrdersCall, fetchInput, incrementNonceCall, newOrder, SELL, signOrders, submitOrders} from '../core/orders'
+import {cancelOrdersCall, fetchInput, incrementNonceCall, newOrder, orderDuration, SELL, signOrders, submitOrders} from '../core/orders'
 import {wallet} from '../core/wallet'
 import Panel from '../components/Panel.vue'
 import Badge from '@zvm/web/components/Badge.vue'
@@ -21,6 +23,8 @@ import HashLink from '../components/HashLink.vue'
 import NftCard from '../components/NftCard.vue'
 import NftImage from '../components/NftImage.vue'
 import StepList from '../components/StepList.vue'
+import CollectionPermissions from '../components/CollectionPermissions.vue'
+import ExchangeCredits from '../components/ExchangeCredits.vue'
 import Usd from '../components/Usd.vue'
 
 const route = useRoute()
@@ -31,6 +35,7 @@ const error = ref<string | null>(null)
 const tab = ref<'owned' | 'created' | 'listings' | 'offers' | 'activity'>('owned')
 const selected = ref<Set<string>>(new Set())
 const bulkPrice = ref('')
+const bulkCurrency = ref<'znn' | 'qsr'>('znn')
 const bulkDays = ref(30)
 
 const market = useMarket()
@@ -68,31 +73,49 @@ function selectAll() {
 
 /** Lists every selected item at one price, with one signature. */
 async function listSelected() {
-  const ex = exchangeAddress()
-  const owner = market.account()
-  if (!ex || !owner || !bulkPrice.value || !selected.value.size) return
-  const price = parseUnits(bulkPrice.value, 18)
-  const items = unlisted.value.filter((i) => selected.value.has(key(i)))
-  const collections = [...new Map(items.map((i) => [i.collection.toLowerCase(), i])).values()]
-  await market.run(
-    async () => (await Promise.all(collections.map((c) => market.approvalFor(c.collection, owner, ex, c.collectionName || 'a collection')))).flat(),
-    async () => {
-      selected.value = new Set()
-      bulkPrice.value = ''
-      await load()
+  const ex = exchangeAddress(), owner = market.account()
+  if (!ex || !owner || !bulkPrice.value || !selected.value.size || market.busy.value) return
+  const draft = {price: bulkPrice.value, currency: bulkCurrency.value, rewardToken: qsr.value,
+    days: bulkDays.value, account: address.value,
+    items: unlisted.value.filter(item => selected.value.has(key(item))).map(item => ({
+      collection: String(item.collection), tokenId: String(item.tokenId), collectionName: String(item.collectionName || 'a collection')}))}
+  if (!draft.items.length) return
+  const selection = () => address.value.toLowerCase() + ':' + [...selected.value].map(value => value.toLowerCase()).sort().join(',')
+  const read = () => ({endpoint: endpoint.url, chainId: wallet.info?.l2.chainId, walletChainId: wallet.evm.chainId,
+    owner: market.account(), signer: wallet.evm.address, provider: wallet.evm.provider, exchange: exchangeAddress(),
+    paymentToken: draft.currency === 'qsr' ? qsr.value : '0x0000000000000000000000000000000000000000', selection: selection()})
+  const captured = {...read(), owner, exchange: ex,
+    paymentToken: draft.currency === 'qsr' ? draft.rewardToken : '0x0000000000000000000000000000000000000000',
+    selection: draft.account.toLowerCase() + ':' + draft.items.map(item => key(item).toLowerCase()).sort().join(',')}
+  let prepared: {quote: ReturnType<typeof listingQuote>; guard: () => void} | null = null
+  await market.run(async () => {
+    const quote = listingQuote(draft.price, draft.currency, draft.rewardToken)
+    orderDuration(draft.days)
+    const guard = quoteContextGuard(read, captured)
+    prepared = {quote, guard}
+    const collections = [...new Map(draft.items.map(item => [item.collection.toLowerCase(), item])).values()]
+    const calls = (await Promise.all(collections.map(item => market.approvalFor(item.collection as Address, owner, ex, item.collectionName)))).flat()
+    guard()
+    return guardedQuoteCalls(calls, guard)
+  }, async () => {selected.value = new Set(); bulkPrice.value = ''; await load()}, {
+    label: `Sign one listing for ${draft.items.length} item${draft.items.length === 1 ? '' : 's'} at ${draft.price} ${draft.currency.toUpperCase()} each`,
+    fn: async () => {
+      if (!prepared) throw new Error('Review the listings before signing.')
+      const {quote, guard} = prepared
+      const orders = []
+      for (const item of draft.items) {
+        guard()
+        orders.push(await newOrder({side: SELL, collection: item.collection as Address,
+          tokenId: BigInt(item.tokenId), price: quote.amount, paymentToken: quote.paymentToken}, draft.days))
+      }
+      guard()
+      const inputs = await signOrders(orders)
+      guard()
+      await submitOrders(inputs)
+      guard()
+      return `${orders.length} listings, one signature, no transaction`
     },
-    {
-      label: `Sign one listing for ${items.length} item${items.length === 1 ? '' : 's'} at ${bulkPrice.value} ZNN each`,
-      fn: async () => {
-        const orders = []
-        for (const i of items) {
-          orders.push(await newOrder({side: SELL, collection: i.collection as Address, tokenId: BigInt(i.tokenId), price}, bulkDays.value))
-        }
-        await submitOrders(await signOrders(orders))
-        return `${orders.length} listings, one signature, no transaction`
-      },
-    },
-  )
+  })
 }
 
 async function cancelOrder(o: any, label: string) {
@@ -120,6 +143,7 @@ const tabs = [
 <template>
   <StateBlock :loading="loading" :error="error">
     <div v-if="profile" class="grid gap-4">
+      <ExchangeCredits :owner="address" />
       <Panel>
         <div class="p-4 flex flex-wrap items-center gap-3">
           <div>
@@ -137,7 +161,7 @@ const tabs = [
           >
             Cancel all {{ profile.openOrders.length }} orders
           </button>
-          <router-link class="btn" :to="`/address/${profile.address}`">Explorer view</router-link>
+          <a class="btn" :href="`${base()}/address/${profile.address}`" target="_blank" rel="noreferrer">Explorer view</a>
         </div>
       </Panel>
 
@@ -160,8 +184,15 @@ const tabs = [
           <div v-if="isMine && unlisted.length" class="px-4 pt-4 flex flex-wrap items-end gap-2">
             <button class="btn" @click="selectAll">{{ selected.size === unlisted.length ? 'Clear' : `Select all ${unlisted.length} unlisted` }}</button>
             <label class="grid gap-1">
-              <span class="ledger">Price each, ZNN</span>
+              <span class="ledger">Price each, {{ bulkCurrency.toUpperCase() }}</span>
               <input v-model="bulkPrice" inputmode="decimal" placeholder="0" aria-label="Price each" class="input w-[120px]" />
+            </label>
+            <label class="grid gap-1">
+              <span class="ledger">Currency</span>
+              <select v-model="bulkCurrency" aria-label="Bulk listing currency" class="input">
+                <option value="znn">ZNN</option>
+                <option v-if="qsr" value="qsr">QSR</option>
+              </select>
             </label>
             <label class="grid gap-1">
               <span class="ledger">Days</span>
@@ -190,10 +221,10 @@ const tabs = [
             <tbody>
               <tr v-for="c in profile.created" :key="c.address">
                 <td class="td w-14">
-                  <router-link :to="`/nft/${c.address}`"><NftImage :src="parseMeta(c.meta).image" :alt="c.name" /></router-link>
+                  <router-link :to="`/collection/${c.address}`"><NftImage :src="parseMeta(c.meta).image" :alt="c.name" /></router-link>
                 </td>
                 <td class="td">
-                  <router-link :to="`/nft/${c.address}`" class="link font-medium">{{ c.name || 'Unnamed' }}</router-link>
+                  <router-link :to="`/collection/${c.address}`" class="link font-medium">{{ c.name || 'Unnamed' }}</router-link>
                   <div class="text-[12px] text-[var(--color-dim)] mono">{{ c.symbol }}</div>
                 </td>
                 <td class="td text-right mono">{{ number(c.items) }} items</td>
@@ -208,10 +239,10 @@ const tabs = [
             <tbody>
               <tr v-for="l in profile.listings" :key="l.hash">
                 <td class="td w-14">
-                  <router-link :to="`/nft/${l.collection}/${l.tokenId}`"><NftImage :src="l.image" :alt="l.name" /></router-link>
+                  <router-link :to="`/item/${l.collection}/${l.tokenId}`"><NftImage :src="l.image" :alt="l.name" /></router-link>
                 </td>
                 <td class="td">
-                  <router-link :to="`/nft/${l.collection}/${l.tokenId}`" class="link">{{ l.name || `#${l.tokenId}` }}</router-link>
+                  <router-link :to="`/item/${l.collection}/${l.tokenId}`" class="link">{{ l.name || `#${l.tokenId}` }}</router-link>
                   <div class="text-[12px] text-[var(--color-dim)]">
                     {{ l.collectionName }}
                     <Badge v-if="l.kind === 1" tone="plain" class="ml-1" title="Signed together with other listings">bulk</Badge>
@@ -239,8 +270,8 @@ const tabs = [
                   <tbody>
                     <tr v-for="o in profile.offersMade ?? []" :key="`m${o.hash}`">
                       <td class="td">
-                        <router-link v-if="o.tokenId" :to="`/nft/${o.collection}/${o.tokenId}`" class="link mono">#{{ o.tokenId }}</router-link>
-                        <router-link v-else :to="`/nft/${o.collection}`" class="link">whole collection</router-link>
+                        <router-link v-if="o.tokenId" :to="`/item/${o.collection}/${o.tokenId}`" class="link mono">#{{ o.tokenId }}</router-link>
+                        <router-link v-else :to="`/collection/${o.collection}`" class="link">whole collection</router-link>
                         <div class="text-[12px] text-[var(--color-dim)]">{{ o.quantity - o.filled }} of {{ o.quantity }} left</div>
                       </td>
                       <td class="td text-right mono">{{ units(o.price, 18, 4) }} ZNN</td>
@@ -257,8 +288,8 @@ const tabs = [
                   <tbody>
                     <tr v-for="o in profile.offersReceived ?? []" :key="`r${o.hash}`">
                       <td class="td">
-                        <router-link v-if="o.tokenId" :to="`/nft/${o.collection}/${o.tokenId}`" class="link mono">#{{ o.tokenId }}</router-link>
-                        <router-link v-else :to="`/nft/${o.collection}`" class="link">whole collection</router-link>
+                        <router-link v-if="o.tokenId" :to="`/item/${o.collection}/${o.tokenId}`" class="link mono">#{{ o.tokenId }}</router-link>
+                        <router-link v-else :to="`/collection/${o.collection}`" class="link">whole collection</router-link>
                         <div class="text-[12px] text-[var(--color-dim)]">from <AddressLink :address="o.bidder" :length="6" /></div>
                       </td>
                       <td class="td text-right mono">{{ units(o.price, 18, 4) }} ZNN</td>
@@ -277,7 +308,7 @@ const tabs = [
               <tr v-for="(a, i) in profile.activity" :key="i">
                 <td class="td"><Badge :tone="a.kind === 'sale' || a.kind === 'bid-accepted' ? 'good' : a.kind === 'list' ? 'info' : a.kind === 'offer' ? 'accent' : 'plain'">{{ a.kind }}</Badge></td>
                 <td class="td">
-                  <router-link v-if="a.tokenId" :to="`/nft/${a.collection}/${a.tokenId}`" class="link mono">#{{ a.tokenId }}</router-link>
+                  <router-link v-if="a.tokenId" :to="`/item/${a.collection}/${a.tokenId}`" class="link mono">#{{ a.tokenId }}</router-link>
                   <AddressLink v-else :address="a.collection" :length="6" />
                 </td>
                 <td class="td"><AddressLink :address="a.from" :length="6" /></td>
@@ -293,6 +324,9 @@ const tabs = [
           </table>
         </StateBlock>
       </Panel>
+
+      <CollectionPermissions v-if="isMine" :owner="profile.address"
+        :collections="[...(profile.owned ?? []), ...(profile.openOrders ?? [])]" @changed="load" />
 
       <p v-if="market.error.value" data-market-error class="text-[13px] text-[var(--color-danger)]">{{ market.error.value }}</p>
       <StepList :steps="market.steps.value" />

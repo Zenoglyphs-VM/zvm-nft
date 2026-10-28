@@ -4,14 +4,17 @@
 // its tokens (D28), and sweeping the floor is one transaction for many listings.
 import {computed, onBeforeUnmount, onMounted, ref, watch} from 'vue'
 import {useRoute} from 'vue-router'
-import {parseUnits, type Address} from 'viem'
+import {type Address} from 'viem'
 import {api} from '../core/api'
 import {wallet} from '../core/wallet'
+import {listingQuote, quotedCount, quoteTotal, quoteContextGuard, guardedQuoteCalls} from '../core/order-quote'
+import {endpoint} from '../core/endpoint'
+import {batchMessage, batchResult, type BatchResult} from '../core/batch-result'
 import {publicClient} from '../core/evm'
-import {ago, number, units} from '../core/format'
+import {ago, number, orderExpiry, units} from '../core/format'
 import {collectionAbi, currencyOf, isZero, parseMeta} from '../core/nft'
 import {exchangeAddress, sameAddress, useMarket} from '../core/market'
-import {bidFunding, BUY, buyManyCall, exchange, fetchFillable, newOrder, signOrder, submitOrders} from '../core/orders'
+import {bidFunding, BUY, buyManyCall, exchange, fetchFillable, newOrder, signOrder, submitOrders, type Input} from '../core/orders'
 import Panel from '../components/Panel.vue'
 import Badge from '@zvm/web/components/Badge.vue'
 import StateBlock from '../components/StateBlock.vue'
@@ -24,7 +27,7 @@ import StepList from '../components/StepList.vue'
 import Usd from '../components/Usd.vue'
 
 const route = useRoute()
-const address = computed(() => String(route.params.collection))
+const address = computed(() => String(route.params.addr))
 const collection = ref<any>(null)
 const items = ref<any[]>([])
 const activity = ref<any[]>([])
@@ -39,6 +42,7 @@ const offering = ref(false)
 const offerPrice = ref('')
 const offerCount = ref(1)
 const sweepCount = ref(3)
+const sweepResult = ref<BatchResult | null>(null)
 
 const market = useMarket()
 const meta = computed(() => parseMeta(collection.value?.meta))
@@ -90,7 +94,7 @@ onMounted(async () => {
   }, 20_000)
 })
 onBeforeUnmount(() => clearInterval(timer))
-watch(() => route.params.collection, () => {
+watch(() => route.params.addr, () => {
   loading.value = true
   activity.value = []
   load()
@@ -99,29 +103,42 @@ watch(tab, loadTab)
 watch([listedOnly, sort], loadItems)
 
 async function submitOffer() {
-  const bidder = market.account()
-  const wrapped = exchange()?.wrappedZnn
-  if (!bidder || !wrapped || !offerPrice.value) return
-  const price = parseUnits(offerPrice.value, 18)
-  const count = BigInt(offerCount.value)
-  await market.run(
-    () => bidFunding(bidder, price * count),
-    async () => {
-      offering.value = false
-      offerPrice.value = ''
-      offers.value = await api.nftOffers({collection: address.value, collectionOnly: 1, limit: 50})
+  const bidder = market.account(), ex = exchangeAddress(), token = exchange()?.wrappedZnn
+  if (!bidder || !ex || !token || !offerPrice.value || market.busy.value) return
+  const draft = {collection: address.value, price: offerPrice.value, count: offerCount.value, paymentToken: token}
+  const read = () => ({endpoint: endpoint.url, chainId: wallet.info?.l2.chainId, walletChainId: wallet.evm.chainId,
+    owner: market.account(), signer: wallet.evm.address, provider: wallet.evm.provider,
+    exchange: exchangeAddress(), paymentToken: exchange()?.wrappedZnn, selection: offering.value ? address.value.toLowerCase() : ''})
+  const captured = {...read(), owner: bidder, exchange: ex, paymentToken: draft.paymentToken, selection: draft.collection.toLowerCase()}
+  let prepared: {quote: ReturnType<typeof listingQuote>; count: bigint; guard: () => void} | null = null
+  await market.run(async () => {
+    const quote = listingQuote(draft.price, 'znn'), count = quotedCount(draft.count)
+    const total = quoteTotal(quote.amount, count)
+    const guard = quoteContextGuard(read, captured)
+    prepared = {quote, count, guard}
+    const calls = await bidFunding(bidder, total)
+    guard()
+    return guardedQuoteCalls(calls, guard)
+  }, async () => {
+    offering.value = false
+    offerPrice.value = ''
+    const rows = await api.nftOffers({collection: draft.collection, collectionOnly: 1, limit: 50})
+    if (sameAddress(address.value, draft.collection)) offers.value = rows
+  }, {
+    label: `Sign an offer of ${draft.price} ZNN each for ${draft.count} item${draft.count === 1 ? '' : 's'}`,
+    fn: async () => {
+      if (!prepared) throw new Error('Review the collection offer before signing.')
+      const {quote, count, guard} = prepared
+      guard()
+      const order = await newOrder({side: BUY, collection: draft.collection as Address, tokenId: 0n,
+        anyToken: true, amount: count, price: quote.amount, paymentToken: draft.paymentToken}, 30)
+      guard()
+      const input = await signOrder(order)
+      guard()
+      await submitOrders([input])
+      guard()
     },
-    {
-      label: `Sign an offer of ${offerPrice.value} ZNN each for ${offerCount.value} item${offerCount.value === 1 ? '' : 's'}`,
-      fn: async () => {
-        const order = await newOrder(
-          {side: BUY, collection: address.value as Address, tokenId: 0n, anyToken: true, amount: count, price, paymentToken: wrapped},
-          30,
-        )
-        await submitOrders([await signOrder(order)])
-      },
-    },
-  )
+  })
 }
 
 /** Buys the cheapest listings in one transaction, skipping any sold a moment earlier. */
@@ -129,15 +146,31 @@ async function sweep() {
   const ex = exchangeAddress()
   const buyer = market.account()
   if (!ex || !buyer) return
+  sweepResult.value = null
+  const chainId = wallet.info?.l2.chainId, node = endpoint.url, selectedCollection = address.value
+  const current = () => sameAddress(market.account(), buyer) && wallet.info?.l2.chainId === chainId &&
+    wallet.evm.chainId === chainId && endpoint.url === node && sameAddress(exchangeAddress(), ex) &&
+    sameAddress(address.value, selectedCollection)
+  const guard = () => {if (!current()) throw new Error('The account or node changed. Review the sweep again.')}
+  let submitted: Input[] = []
+  let nativeSent = 0n
   await market.run(async () => {
-    const listings = await api.nftListings({collection: address.value, sort: 'price', limit: 50})
+    const listings = await api.nftListings({collection: selectedCollection, sort: 'price', limit: 50})
     const picked = listings.filter((l) => isZero(l.currency) && !sameAddress(l.seller, buyer)).slice(0, sweepCount.value)
     if (!picked.length) throw new Error('nothing here is for sale in ZNN by someone else')
     const inputs = await fetchFillable(picked.map((l) => l.hash))
     if (!inputs.length) throw new Error('every listing here was bought a moment ago — try again')
-    const total = inputs.reduce((sum, i) => sum + i.order.price, 0n)
-    return [buyManyCall(ex, inputs, total)]
-  }, load)
+    submitted = inputs
+    nativeSent = inputs.reduce((sum, i) => sum + i.order.price, 0n)
+    guard()
+    return [{...buyManyCall(ex, inputs, nativeSent), guard}]
+  }, async () => {
+    const step = [...market.steps.value].reverse().find(step => step.receipt)
+    if (!step?.receipt || step.txHash !== step.receipt.transactionHash) throw new Error('The executed sweep receipt is unavailable.')
+    sweepResult.value = batchResult(step.receipt, ex, buyer as Address, submitted, nativeSent)
+    guard()
+    await load()
+  })
 }
 </script>
 
@@ -198,6 +231,7 @@ async function sweep() {
         <div v-if="market.error.value || market.steps.value.length" class="px-4 pb-4 grid gap-3 max-w-[520px]">
           <p v-if="market.error.value" data-market-error class="text-[13px] text-[var(--color-danger)]">{{ market.error.value }}</p>
           <StepList :steps="market.steps.value" />
+          <p v-if="sweepResult" data-batch-outcome role="status" class="text-[13px]">{{ batchMessage(sweepResult) }}</p>
         </div>
       </Panel>
 
@@ -257,7 +291,7 @@ async function sweep() {
                     <Badge :tone="a.kind === 'sale' || a.kind === 'bid-accepted' ? 'good' : a.kind === 'list' ? 'info' : a.kind === 'offer' ? 'accent' : 'plain'">{{ a.kind }}</Badge>
                   </td>
                   <td class="td">
-                    <router-link v-if="a.tokenId" :to="`/nft/${collection.address}/${a.tokenId}`" class="link mono">#{{ a.tokenId }}</router-link>
+                    <router-link v-if="a.tokenId" :to="`/item/${collection.address}/${a.tokenId}`" class="link mono">#{{ a.tokenId }}</router-link>
                     <span v-else class="text-[var(--color-dim)]">collection</span>
                   </td>
                   <td class="td"><AddressLink :address="a.from" :length="6" /></td>
@@ -292,7 +326,7 @@ async function sweep() {
                   <div class="text-[12px]"><Usd :amount="o.price" :decimals="18" token="znn" /></div>
                 </td>
                 <td class="td text-right mono">{{ o.quantity - o.filled }} of {{ o.quantity }}</td>
-                <td class="td text-[12.5px] text-[var(--color-dim)]">{{ ago(o.expiry) === '0s ago' ? 'expired' : new Date(o.expiry * 1000).toLocaleDateString() }}</td>
+                <td class="td text-[12.5px] text-[var(--color-dim)]">{{ orderExpiry(o.expiry) }}</td>
               </tr>
             </tbody>
           </table>

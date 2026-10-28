@@ -81,6 +81,17 @@ export function approveCollectionCall(collection: Address, market: Address, name
   }
 }
 
+/** Removes this exchange operator permission for every token in the collection. */
+export function revokeCollectionCall(collection: Address, market: Address, name = 'this collection'): Call {
+  return {
+    to: collection,
+    value: 0n,
+    gas: 70_000n,
+    label: `Revoke exchange access to ${name}`,
+    data: encodeFunctionData({abi: collectionAbi, functionName: 'setApprovalForAll', args: [market, false]}),
+  }
+}
+
 export function createCollectionCall(factory: Address, name: string, symbol: string, contractURI: string, royaltyBps: number): Call {
   return {
     to: factory,

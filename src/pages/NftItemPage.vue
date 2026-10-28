@@ -5,13 +5,15 @@
 // cancelling, because a signature cannot be taken back any other way.
 import {computed, onBeforeUnmount, onMounted, ref, watch} from 'vue'
 import {useRoute} from 'vue-router'
-import {parseUnits, type Address} from 'viem'
+import {type Address} from 'viem'
 import {api} from '../core/api'
 import {wallet} from '../core/wallet'
+import {endpoint} from '../core/endpoint'
+import {listingQuote, relistingQuote, quoteContextGuard, guardedQuoteCalls} from '../core/order-quote'
 import {publicClient} from '../core/evm'
-import {ago, number, short, units} from '../core/format'
+import {ago, number, orderDate, short, units} from '../core/format'
 import {mediaURL} from '../core/media'
-import {currencyOf, isZero, NATIVE, parseMeta} from '../core/nft'
+import {currencyOf, isZero, parseMeta} from '../core/nft'
 import {exchangeAddress, sameAddress, useMarket} from '../core/market'
 import {
   acceptBidCall,
@@ -22,6 +24,7 @@ import {
   exchange,
   fetchInput,
   newOrder,
+  orderDuration,
   SELL,
   signOrder,
   submitOrders,
@@ -37,7 +40,7 @@ import StepList from '../components/StepList.vue'
 import Usd from '../components/Usd.vue'
 
 const route = useRoute()
-const collection = computed(() => String(route.params.collection))
+const collection = computed(() => String(route.params.addr))
 const tokenId = computed(() => String(route.params.id))
 const item = ref<any>(null)
 const loading = ref(true)
@@ -76,14 +79,12 @@ onMounted(() => {
   }, 15_000)
 })
 onBeforeUnmount(() => clearInterval(timer))
-watch(() => [route.params.collection, route.params.id], () => {
+watch(() => [route.params.addr, route.params.id], () => {
   loading.value = true
   item.value = null
   load()
 })
 
-const currencyAddress = computed<Address>(() => (currency.value === 'qsr' && qsr.value ? (qsr.value as Address) : (NATIVE as Address)))
-const currencyDecimals = computed(() => (currency.value === 'qsr' ? 8 : 18))
 const name = computed(() => item.value?.name || `#${tokenId.value}`)
 const closePanel = async () => {
   panel.value = 'none'
@@ -111,25 +112,43 @@ async function buy() {
 }
 
 async function list() {
-  const ex = exchangeAddress()
-  const owner = market.account()
-  if (!ex || !owner || !price.value) return
-  const amount = parseUnits(price.value, currencyDecimals.value)
-  await market.run(
-    () => market.approvalFor(collection.value as Address, owner, ex, collectionInfo.value?.name ?? 'this collection'),
-    closePanel,
-    {
-      label: `Sign a listing of ${name.value} for ${price.value} ${currency.value.toUpperCase()}`,
-      fn: async () => {
-        const order = await newOrder(
-          {side: SELL, collection: collection.value as Address, tokenId: BigInt(tokenId.value), price: amount, paymentToken: currencyAddress.value},
-          days.value,
-        )
-        await submitOrders([await signOrder(order)])
-        return 'no transaction: the node holds your signature until someone buys'
-      },
+  const ex = exchangeAddress(), owner = market.account()
+  if (!ex || !owner || !price.value || market.busy.value) return
+  const draft = {collection: collection.value, tokenId: tokenId.value, price: price.value,
+    currency: currency.value, days: days.value, rewardToken: qsr.value, name: name.value,
+    collectionName: collectionInfo.value?.name ?? 'this collection'}
+  const selection = () => panel.value === 'list' ? collection.value.toLowerCase() + ':' + tokenId.value : ''
+  const read = () => ({endpoint: endpoint.url, chainId: wallet.info?.l2.chainId, walletChainId: wallet.evm.chainId,
+    owner: market.account(), signer: wallet.evm.address, provider: wallet.evm.provider,
+    exchange: exchangeAddress(), paymentToken: draft.currency === 'qsr' ? qsr.value : '0x0000000000000000000000000000000000000000', selection: selection()})
+  const captured = {...read(), owner, exchange: ex,
+    paymentToken: draft.currency === 'qsr' ? draft.rewardToken : '0x0000000000000000000000000000000000000000',
+    selection: draft.collection.toLowerCase() + ':' + draft.tokenId}
+  let prepared: {quote: ReturnType<typeof listingQuote>; guard: () => void} | null = null
+  await market.run(async () => {
+    const quote = listingQuote(draft.price, draft.currency, draft.rewardToken)
+    orderDuration(draft.days)
+    const guard = quoteContextGuard(read, captured)
+    prepared = {quote, guard}
+    const calls = await market.approvalFor(draft.collection as Address, owner, ex, draft.collectionName)
+    guard()
+    return guardedQuoteCalls(calls, guard)
+  }, closePanel, {
+    label: `Sign a listing of ${draft.name} for ${draft.price} ${draft.currency.toUpperCase()}`,
+    fn: async () => {
+      if (!prepared) throw new Error('Review the listing before signing.')
+      const {quote, guard} = prepared
+      guard()
+      const order = await newOrder({side: SELL, collection: draft.collection as Address,
+        tokenId: BigInt(draft.tokenId), price: quote.amount, paymentToken: quote.paymentToken}, draft.days)
+      guard()
+      const input = await signOrder(order)
+      guard()
+      await submitOrders([input])
+      guard()
+      return 'no transaction: the node holds your signature until someone buys'
     },
-  )
+  })
 }
 
 async function cancel() {
@@ -139,18 +158,38 @@ async function cancel() {
 }
 
 async function offer() {
-  const ex = exchangeAddress()
-  const bidder = market.account()
-  if (!ex || !bidder || !price.value || !wrapped.value) return
-  const amount = parseUnits(price.value, 18)
-  await market.run(() => bidFunding(bidder, amount), closePanel, {
-    label: `Sign an offer of ${price.value} ZNN for ${name.value}`,
+  const ex = exchangeAddress(), bidder = market.account(), token = wrapped.value
+  if (!ex || !bidder || !token || !price.value || market.busy.value) return
+  const draft = {collection: collection.value, tokenId: tokenId.value, price: price.value,
+    days: days.value, name: name.value, paymentToken: token}
+  const read = () => ({endpoint: endpoint.url, chainId: wallet.info?.l2.chainId, walletChainId: wallet.evm.chainId,
+    owner: market.account(), signer: wallet.evm.address, provider: wallet.evm.provider,
+    exchange: exchangeAddress(), paymentToken: wrapped.value,
+    selection: panel.value === 'offer' ? collection.value.toLowerCase() + ':' + tokenId.value : ''})
+  const captured = {...read(), owner: bidder, exchange: ex, paymentToken: draft.paymentToken,
+    selection: draft.collection.toLowerCase() + ':' + draft.tokenId}
+  let prepared: {quote: ReturnType<typeof listingQuote>; guard: () => void} | null = null
+  await market.run(async () => {
+    const quote = listingQuote(draft.price, 'znn')
+    orderDuration(draft.days)
+    const guard = quoteContextGuard(read, captured)
+    prepared = {quote, guard}
+    const calls = await bidFunding(bidder, quote.amount)
+    guard()
+    return guardedQuoteCalls(calls, guard)
+  }, closePanel, {
+    label: `Sign an offer of ${draft.price} ZNN for ${draft.name}`,
     fn: async () => {
-      const order = await newOrder(
-        {side: BUY, collection: collection.value as Address, tokenId: BigInt(tokenId.value), price: amount, paymentToken: wrapped.value!},
-        days.value,
-      )
-      await submitOrders([await signOrder(order)])
+      if (!prepared) throw new Error('Review the offer before signing.')
+      const {quote, guard} = prepared
+      guard()
+      const order = await newOrder({side: BUY, collection: draft.collection as Address,
+        tokenId: BigInt(draft.tokenId), price: quote.amount, paymentToken: draft.paymentToken}, draft.days)
+      guard()
+      const input = await signOrder(order)
+      guard()
+      await submitOrders([input])
+      guard()
     },
   })
 }
@@ -176,7 +215,13 @@ async function withdrawOffer(o: any) {
 
 function openPanel(which: 'list' | 'offer') {
   panel.value = panel.value === which ? 'none' : which
-  price.value = which === 'list' && listing.value ? units(listing.value.price, listingCurrency.value.decimals, 6).replace(/,/g, '') : ''
+  price.value = ''
+  if (which !== 'list' || !listing.value) return
+  try {
+    const original = relistingQuote(listing.value.price, listing.value.currency, qsr.value)
+    currency.value = original.currency
+    price.value = original.text
+  } catch (err: any) {market.error.value = err?.message ?? 'Review the original listing price.'}
 }
 </script>
 
@@ -211,7 +256,7 @@ function openPanel(which: 'list' | 'offer') {
         <Panel>
           <div class="p-4 grid gap-3">
             <div>
-              <router-link :to="`/nft/${item.collection}`" class="link text-[13px]">{{ collectionInfo?.name || 'Collection' }}</router-link>
+              <router-link :to="`/collection/${item.collection}`" class="link text-[13px]">{{ collectionInfo?.name || 'Collection' }}</router-link>
               <h1 class="text-[20px] font-semibold tracking-tight mt-0.5">{{ name }}</h1>
               <p class="text-[13px] text-[var(--color-dim)] mt-1">
                 Held by <AddressLink :address="item.owner" :length="8" />
@@ -230,7 +275,7 @@ function openPanel(which: 'list' | 'offer') {
                   <div class="text-[13px]">
                     <Usd :amount="listing.price" :decimals="listingCurrency.decimals" :token="listingCurrency.key" />
                     <span class="text-[var(--color-dim)]"> · listed by </span><AddressLink :address="listing.seller" :length="6" />
-                    <span class="text-[var(--color-dim)]"> · until {{ new Date(listing.expiry * 1000).toLocaleDateString() }}</span>
+                    <span class="text-[var(--color-dim)]"> · until {{ orderDate(listing.expiry) }}</span>
                   </div>
                 </div>
                 <div class="flex flex-wrap gap-2">
@@ -299,7 +344,7 @@ function openPanel(which: 'list' | 'offer') {
                     <div class="text-[12px]"><Usd :amount="o.price" :decimals="18" token="znn" /></div>
                   </td>
                   <td class="td"><AddressLink :address="o.bidder" :length="6" /></td>
-                  <td class="td text-[12.5px] text-[var(--color-dim)]">until {{ new Date(o.expiry * 1000).toLocaleDateString() }}</td>
+                  <td class="td text-[12.5px] text-[var(--color-dim)]">until {{ orderDate(o.expiry) }}</td>
                   <td class="td text-right">
                     <button v-if="isOwner" class="btn px-2.5 py-1 text-[12.5px]" :disabled="market.busy.value" @click="accept(o)">Accept</button>
                     <button

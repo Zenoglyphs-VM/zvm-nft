@@ -3,7 +3,7 @@
 // the relayer, which posts it to NoM, and it is a ZVM transaction once the
 // momentum carrying it is derived.
 
-import type {Address, Hex} from 'viem'
+import type {Address, Hex, TransactionReceipt} from 'viem'
 import {estimateFees, publicClient, walletClient} from './evm'
 import {wallet} from './wallet'
 /** One contract call a wallet is asked to sign. */
@@ -11,6 +11,14 @@ export interface Call {
   to: Address
   data: Hex
   value: bigint
+  /** Recheck the selected account and node after asynchronous preparation. */
+  guard?: () => void
+  /** Synchronously retain recovery context immediately before a wallet request. */
+  onRequest?: () => void
+  /** Synchronously retain the wallet's exact hash before waiting for execution. */
+  onSubmitted?: (hash: string) => void
+  /** Distinguish failures before dispatch from an uncertain requested outcome. */
+  onFailed?: (error: unknown, requested: boolean) => void
   /** A generous limit, used where estimating is impossible. */
   gas: bigint
   label: string
@@ -21,6 +29,8 @@ export interface Step {
   state: 'pending' | 'signing' | 'published' | 'done' | 'failed'
   txHash?: string
   detail?: string
+  /** The executed receipt, kept in memory for flow-specific reconciliation. */
+  receipt?: TransactionReceipt
 }
 
 /** The account calls are sent from, or null when no wallet is connected. */
@@ -54,21 +64,34 @@ export async function runCalls(calls: Call[], update: (steps: Step[]) => void): 
   const signer = walletClient(wallet.evm.provider, info.l2.chainId, from)
   for (const [i, call] of calls.entries()) {
     const step = steps[i]
+    let requested = false
     try {
+      call.guard?.()
       step.state = 'signing'
       emit()
       const [gas, {maxFeePerGas, maxPriorityFeePerGas}] = await Promise.all([estimate(from, call), estimateFees(info.l2.chainId)])
+      call.guard?.()
+      if (call.onRequest) {
+        call.onRequest()
+        call.guard?.()
+      }
+      requested = true
       const hash = await signer.sendTransaction({to: call.to, data: call.data, value: call.value, gas, maxFeePerGas, maxPriorityFeePerGas})
       step.txHash = hash
+      call.onSubmitted?.(hash)
       step.state = 'published'
       emit()
       const r = await client.waitForTransactionReceipt({hash, ...RECEIPT})
       if (r.status !== 'success') throw new Error('reverted on the ZVM')
+      step.receipt = r
       step.state = 'done'
       emit()
     } catch (err) {
       step.state = 'failed'
       step.detail = reason(err)
+      try {call.onFailed?.(err, requested)} catch {
+        step.detail += ' The recovery record could not be updated; keep any original transaction hash.'
+      }
       emit()
       return steps
     }
